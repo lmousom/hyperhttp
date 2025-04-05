@@ -61,19 +61,12 @@ jobs:
           --notes "$CHANGES" \
           dist/*
 
-    - name: Publish to Test PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        repository-url: https://test.pypi.org/legacy/
-        skip-existing: true
-        password: ${{ secrets.TEST_PYPI_API_TOKEN }}
-
     - name: Publish to PyPI
-      if: success()
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
-        skip-existing: true
+        skip-existing: false
         password: ${{ secrets.PYPI_API_TOKEN }}
+        verbose: true
 
     - name: Set up Read the Docs
       env:
