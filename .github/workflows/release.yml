@@ -40,13 +40,20 @@ jobs:
 
     - name: Create GitHub Release
       env:
-        GITHUB_TOKEN: ${{ secrets.TOKEN }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         TAG=${GITHUB_REF#refs/tags/}
         VERSION=${TAG#v}
         
         # Extract changes from CHANGELOG.md
-        CHANGES=$(awk "/## \[$VERSION\]/{flag=1;next}/## \[/{flag=0}flag" docs/changelog.md)
+        if [ -f docs/changelog.md ]; then
+          echo "Found changelog file"
+          CHANGES=$(awk "/## \[$VERSION\]/{flag=1;next}/## \[/{flag=0}flag" docs/changelog.md)
+          echo "Extracted changes: $CHANGES"
+        else
+          echo "Changelog file not found"
+          CHANGES="Release $VERSION"
+        fi
         
         # Create GitHub release
         gh release create $TAG \
