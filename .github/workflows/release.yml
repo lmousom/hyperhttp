@@ -66,12 +66,14 @@ jobs:
       with:
         repository-url: https://test.pypi.org/legacy/
         skip-existing: true
+        password: ${{ secrets.TEST_PYPI_API_TOKEN }}
 
     - name: Publish to PyPI
       if: success()
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
         skip-existing: true
+        password: ${{ secrets.PYPI_API_TOKEN }}
 
     - name: Set up Read the Docs
       env:
