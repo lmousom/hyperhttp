@@ -8,6 +8,7 @@ import socket
 import ssl
 import time
 from typing import Dict, Any, Optional, Deque, Tuple, Union, List
+import certifi
 
 from hyperhttp.utils.buffer_pool import BufferPool
 
@@ -147,7 +148,10 @@ class Connection:
     
     def _create_default_ssl_context(self) -> ssl.SSLContext:
         """Create a default SSL context with good security settings."""
-        context = ssl.create_default_context()
+        context = ssl.create_default_context(
+            cafile=certifi.where(),
+            capath=certifi.where()
+        )
         context.set_alpn_protocols(["h2", "http/1.1"])
         context.options |= ssl.OP_NO_COMPRESSION  # Disable compression (CRIME attack)
         return context
