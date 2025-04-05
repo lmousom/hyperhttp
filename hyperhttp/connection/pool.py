@@ -39,9 +39,9 @@ class ConnectionPool:
         port: int,
         scheme: str,
         min_connections: int = 0,
-        max_connections: int = 10,
-        max_keepalive: float = 300,
-        ttl_check_interval: float = 30,
+        max_connections: int = 20,
+        max_keepalive: float = 120,
+        ttl_check_interval: float = 15,
     ):
         self._hostname = hostname
         self._port = port
@@ -67,6 +67,11 @@ class ConnectionPool:
         
         # Host key for pool lookup
         self.host_key = f"{hostname}:{port}"
+        
+        # Validation tracking
+        self._last_validation_time = time.monotonic()
+        self._validation_success_count = 0
+        self._validation_failure_count = 0
         
     def _create_connection_factory(self) -> ConnectionFactory:
         """Create a connection factory for this pool."""
@@ -198,20 +203,44 @@ class ConnectionPool:
             True if the connection is valid, False otherwise
         """
         # Check if connection is marked as non-reusable
-        if not connection.is_reusable():
+        if connection.metadata.marked_for_close:
             return False
             
-        # Check if connection has been idle too long
-        if (connection.metadata.idle_since is not None and
-            time.monotonic() - connection.metadata.idle_since > self.max_idle_time):
-            return False
+        # Adaptive validation based on success rate
+        current_time = time.monotonic()
+        time_since_last_validation = current_time - self._last_validation_time
+        
+        # Calculate validation success rate
+        total_validations = self._validation_success_count + self._validation_failure_count
+        if total_validations > 0:
+            success_rate = self._validation_success_count / total_validations
+        else:
+            success_rate = 1.0
             
-        # Perform health check if needed
-        if time.monotonic() - connection.metadata.last_checked > self.health_check_interval:
-            if not await connection.check_health():
-                return False
+        # Skip validation if:
+        # 1. Connection was recently used (within 5 seconds)
+        # 2. High success rate (>95%) and not too much time passed
+        if (current_time - connection.metadata.last_used < 5 or
+            (success_rate > 0.95 and time_since_last_validation < 30)):
+            return True
+            
+        # Update last validation time
+        self._last_validation_time = current_time
+        
+        try:
+            # Perform actual validation
+            is_healthy = await connection.check_health()
+            
+            # Update validation stats
+            if is_healthy:
+                self._validation_success_count += 1
+            else:
+                self._validation_failure_count += 1
                 
-        return True
+            return is_healthy
+        except Exception:
+            self._validation_failure_count += 1
+            return False
     
     async def _close_connection(self, connection: Connection) -> None:
         """Close a connection and clean up resources."""
@@ -278,9 +307,9 @@ class ConnectionPoolManager:
     
     def __init__(
         self,
-        max_connections: int = 100,
-        max_connections_per_host: int = 10,
-        max_keepalive: float = 300,
+        max_connections: int = 200,
+        max_connections_per_host: int = 20,
+        max_keepalive: float = 120,
     ):
         # Host-specific pools (hostname:port → pool)
         self._host_pools: Dict[str, ConnectionPool] = {}

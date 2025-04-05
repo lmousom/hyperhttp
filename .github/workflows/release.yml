@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine wheel
+        pip install -e ".[dev,test,doc]"
+
+    - name: Run tests
+      run: |
+        pytest --cov=hyperhttp
+
+    - name: Build package
+      run: |
+        python -m build
+
+    - name: Create GitHub Release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        TAG=${GITHUB_REF#refs/tags/}
+        VERSION=${TAG#v}
+        
+        # Extract changes from CHANGELOG.md
+        CHANGES=$(awk "/## \[$VERSION\]/{flag=1;next}/## \[/{flag=0}flag" docs/changelog.md)
+        
+        # Create GitHub release
+        gh release create $TAG \
+          --title "HyperHTTP $VERSION" \
+          --notes "$CHANGES" \
+          dist/*
+
+    - name: Publish to Test PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        repository-url: https://test.pypi.org/legacy/
+        skip-existing: true
+
+    - name: Publish to PyPI
+      if: success()
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        skip-existing: true
+
+    - name: Set up Read the Docs
+      env:
+        READTHEDOCS_TOKEN: ${{ secrets.READTHEDOCS_TOKEN }}
+      run: |
+        # Install Read the Docs client
+        pip install readthedocs-cli
+
+        # Trigger build
+        readthedocs-cli build --project hyperhttp --version latest
+
+  notify:
+    needs: release
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+    - name: Notify on success
+      if: ${{ needs.release.result == 'success' }}
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        
+        if [ ! -z "$DISCORD_WEBHOOK" ]; then
+          curl -H "Content-Type: application/json" \
+               -d "{\"content\": \"🎉 HyperHTTP $VERSION has been released! https://github.com/lmousom/hyperhttp/releases/tag/v$VERSION\"}" \
+               $DISCORD_WEBHOOK
+        fi
+        
+        if [ ! -z "$SLACK_WEBHOOK" ]; then
+          curl -X POST -H "Content-Type: application/json" \
+               -d "{\"text\": \"🎉 HyperHTTP $VERSION has been released! https://github.com/lmousom/hyperhttp/releases/tag/v$VERSION\"}" \
+               $SLACK_WEBHOOK
+        fi
+
+    - name: Notify on failure
+      if: ${{ needs.release.result == 'failure' }}
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+      run: |
+        VERSION=${GITHUB_REF#refs/tags/v}
+        
+        if [ ! -z "$DISCORD_WEBHOOK" ]; then
+          curl -H "Content-Type: application/json" \
+               -d "{\"content\": \"❌ Release of HyperHTTP $VERSION failed! Please check the GitHub Actions logs.\"}" \
+               $DISCORD_WEBHOOK
+        fi
+        
+        if [ ! -z "$SLACK_WEBHOOK" ]; then
+          curl -X POST -H "Content-Type: application/json" \
+               -d "{\"text\": \"❌ Release of HyperHTTP $VERSION failed! Please check the GitHub Actions logs.\"}" \
+               $SLACK_WEBHOOK
+        fi 
