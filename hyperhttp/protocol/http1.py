@@ -64,7 +64,7 @@ class HTTP1Protocol(Protocol):
         request_headers = {
             "Host": f"{hostname}:{port}" if port not in (80, 443) else hostname,
             "Connection": "keep-alive",
-            "User-Agent": "hyperhttp/0.1.0",
+            "User-Agent": "hyperhttp/1.0.0",
         }
         
         if headers:

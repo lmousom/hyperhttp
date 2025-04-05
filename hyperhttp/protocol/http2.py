@@ -213,7 +213,7 @@ class HTTP2Protocol(Protocol):
             (":scheme", scheme),
             (":authority", f"{hostname}:{port}" if port not in (80, 443) else hostname),
             (":path", path),
-            ("user-agent", "hyperhttp/0.1.0"),
+            ("user-agent", "hyperhttp/1.0.0"),
         ]
         
         # Add custom headers

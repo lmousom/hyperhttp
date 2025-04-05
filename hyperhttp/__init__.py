@@ -11,6 +11,6 @@ from typing import Dict, Any, List, Optional, Union, Tuple, Type
 
 from hyperhttp.client import Client, Response
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = ["Client", "Response"]
