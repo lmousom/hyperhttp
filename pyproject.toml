@@ -44,12 +44,17 @@ dev = [
 doc = [
     "mkdocs>=1.3.0",
     "mkdocs-material>=8.2.0",
+    "mkdocstrings>=0.24.0",
+    "mkdocstrings-python>=1.7.0",
+    "pymdown-extensions>=10.0",
+    "pygments>=2.15.0",
+    "mike>=1.1.2"  # For versioned docs
 ]
 
 [project.urls]
 "Homepage" = "https://github.com/lmousom/hyperhttp"
 "Bug Tracker" = "https://github.com/lmousom/hyperhttp/issues"
-"Documentation" = "https://github.com/lmousom/hyperhttp/blob/main/README.md"
+"Documentation" = "https://hyperhttp.readthedocs.io"
 "Source Code" = "https://github.com/lmousom/hyperhttp"
 
 [tool.black]
