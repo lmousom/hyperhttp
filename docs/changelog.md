@@ -8,16 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Initial release of HyperHTTP
-- Async-first HTTP client implementation
-- HTTP/2 support with multiplexing
-- Advanced connection pooling
-- Memory-efficient buffer pooling
-- Sophisticated retry mechanisms
-- Circuit breaker implementation
-- Comprehensive error handling
-- Performance monitoring and metrics
-- Extensive documentation
+- N/A
 
 ### Changed
 - N/A
@@ -37,7 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.0] - 2025-04-05
 
 ### Added
-- First public release
+- Initial release of HyperHTTP
+- Async-first HTTP client implementation
+- HTTP/2 support with multiplexing
+- Advanced connection pooling
+- Memory-efficient buffer pooling
+- Sophisticated retry mechanisms
+- Circuit breaker implementation
+- Comprehensive error handling
+- Performance monitoring and metrics
+- Extensive documentation
 - Core HTTP client functionality
 - Basic documentation
 - Test suite
