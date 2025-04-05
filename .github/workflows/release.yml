@@ -69,14 +69,21 @@ jobs:
         verbose: true
 
     - name: Set up Read the Docs
+      if: env.READTHEDOCS_TOKEN != ''
       env:
         READTHEDOCS_TOKEN: ${{ secrets.READTHEDOCS_TOKEN }}
       run: |
         # Install Read the Docs client
-        pip install readthedocs-cli
-
+        python -m pip install --upgrade readthedocs-cli
+        
+        # Add local bin to PATH
+        export PATH=$PATH:$HOME/.local/bin
+        
+        # Verify installation
+        which rtd
+        
         # Trigger build
-        readthedocs-cli build --project hyperhttp --version latest
+        rtd build --project hyperhttp --version latest
 
   notify:
     needs: release
