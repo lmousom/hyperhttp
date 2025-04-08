@@ -1,8 +1,5 @@
-# Tests for connection handling
-
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, Mock, patch
 from hyperhttp.connection.pool import (
     ConnectionPool,
     ConnectionPoolManager,

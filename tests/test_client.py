@@ -1,8 +1,4 @@
-# Tests for client interface
-
-import json
 import pytest
-from unittest.mock import Mock, AsyncMock
 from hyperhttp.client import Client, Response, HttpError
 
 @pytest.fixture
