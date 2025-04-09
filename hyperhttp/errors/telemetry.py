@@ -6,7 +6,7 @@ import asyncio
 import collections
 import logging
 import time
-from typing import Dict, Any, Optional, List, Set, Deque, DefaultDict, Counter
+from typing import Dict, Any, Optional, List, DefaultDict, Counter
 
 # Logger
 logger = logging.getLogger("hyperhttp.errors.telemetry")

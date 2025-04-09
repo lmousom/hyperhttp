@@ -1,7 +1,6 @@
 import asyncio
 from unittest.mock import Mock, patch, AsyncMock, MagicMock, call
 import ssl
-import urllib.parse
 
 import pytest
 import h2.connection
@@ -12,7 +11,6 @@ import h2.exceptions
 import h2.config
 
 from hyperhttp.protocol.http2 import HTTP2Protocol, HTTP2Stream
-from hyperhttp.utils.buffer_pool import BufferPool
 
 
 class TestHTTP2Stream:
