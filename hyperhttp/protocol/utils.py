@@ -6,7 +6,7 @@ import json
 import re
 import urllib.parse
 from hyperhttp.utils.buffer_pool import BufferPool
-from typing import Dict, Any, Tuple, Optional, Union, List, Iterator
+from typing import Dict, Any, Tuple, Optional, Union
 
 # Regular expression patterns for HTTP parsing
 HEADER_LINE_PATTERN = re.compile(rb"([^:]+):\s*(.*?)\r\n")

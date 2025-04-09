@@ -6,7 +6,7 @@ import asyncio
 import logging
 import ssl
 import urllib.parse
-from typing import Dict, Any, Optional, Union, Tuple, List, Set, DefaultDict, Deque
+from typing import Dict, Any, Optional, Union
 import collections
 
 # Use the h2 library for HTTP/2 protocol implementation

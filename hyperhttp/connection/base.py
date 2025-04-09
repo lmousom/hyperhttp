@@ -7,7 +7,7 @@ import collections
 import socket
 import ssl
 import time
-from typing import Dict, Any, Optional, Deque, Tuple, Union, List
+from typing import Dict, Any, Optional, Deque, Union
 import certifi
 
 from hyperhttp.utils.buffer_pool import BufferPool

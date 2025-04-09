@@ -3,9 +3,8 @@ HTTP/1.1 protocol implementation.
 """
 
 import asyncio
-import json
 import urllib.parse
-from typing import Dict, Any, Optional, Union, Tuple, List
+from typing import Dict, Any, Optional, Union
 
 from hyperhttp.connection.base import Connection
 from hyperhttp.protocol.base import Protocol

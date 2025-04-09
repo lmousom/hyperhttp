@@ -7,7 +7,7 @@ import collections
 import logging
 import random
 import time
-from typing import Deque, Dict, Any, Optional
+from typing import Deque, Optional
 
 # Logger
 logger = logging.getLogger("hyperhttp.utils.backoff")

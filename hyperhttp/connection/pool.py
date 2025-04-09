@@ -7,7 +7,7 @@ import collections
 import logging
 import time
 import urllib.parse
-from typing import Dict, Any, Deque, Optional, Set, List, Tuple, TypeVar, Type, Callable
+from typing import Dict, Deque, Optional, Set, List, Callable
 
 from hyperhttp.connection.base import Connection, ConnectionMetadata
 from hyperhttp.protocol.http1 import HTTP1Connection

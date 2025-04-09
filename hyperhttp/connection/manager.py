@@ -5,7 +5,7 @@ Connection lifecycle management.
 import asyncio
 import logging
 import time
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Optional
 
 from hyperhttp.connection.base import Connection
 from hyperhttp.connection.pool import ConnectionPool, ConnectionPoolManager

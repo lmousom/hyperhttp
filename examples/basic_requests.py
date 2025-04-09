@@ -5,7 +5,6 @@ Basic usage examples for HyperHTTP client.
 import asyncio
 import json
 import time
-from typing import Dict, Any
 
 from hyperhttp import Client
 

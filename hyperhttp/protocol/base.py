@@ -3,7 +3,7 @@ Base protocol classes for HTTP implementations.
 """
 
 import abc
-from typing import Dict, Any, Optional, Union, Tuple
+from typing import Dict, Any, Optional, Union
 
 from hyperhttp.utils.buffer_pool import BufferPool
 

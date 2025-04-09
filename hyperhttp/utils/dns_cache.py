@@ -6,7 +6,7 @@ import asyncio
 import logging
 import socket
 import time
-from typing import Dict, List, Tuple, Any, Optional, Set
+from typing import Dict, List, Tuple, Any, Optional
 
 # Logger
 logger = logging.getLogger("hyperhttp.utils.dns_cache")

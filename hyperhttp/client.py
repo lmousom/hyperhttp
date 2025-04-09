@@ -4,8 +4,7 @@ Main client interface for HyperHTTP.
 
 import asyncio
 import json
-import typing
-from typing import Dict, Any, List, Optional, Union, Tuple, Callable, TypeVar
+from typing import Dict, Any, Optional, Union, TypeVar
 from urllib.parse import urljoin
 
 from hyperhttp.connection.pool import ConnectionPoolManager
