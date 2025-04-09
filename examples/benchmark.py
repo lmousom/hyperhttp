@@ -2,7 +2,7 @@
 Benchmarking tool for comparing HyperHTTP with other HTTP clients.
 
 This benchmark measures performance characteristics for different HTTP clients
-including requests/second, memory usage, and latency distribution.
+including requests/second, memory usage, and latency distribution under realistic workloads.
 """
 
 import argparse
@@ -13,9 +13,9 @@ import gc
 import tracemalloc
 import json
 import csv
+import random
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, Any, List, Callable, Awaitable, Optional, Tuple, Union
+from typing import Dict, Any, List, Callable, Optional
 from dataclasses import dataclass
 from tqdm import tqdm
 import numpy as np
@@ -45,18 +45,31 @@ except ImportError:
 
 # Client factory functions
 def make_hyperhttp_client() -> Client:
-    """Create a HyperHTTP client."""
-    return Client()
+    """Create a HyperHTTP client with realistic settings."""
+    return Client(
+        max_connections=100,
+        timeout=30
+    )
 
 
 def make_httpx_client() -> httpx.AsyncClient:
-    """Create an HTTPX client."""
-    return httpx.AsyncClient(http2=True)
+    """Create an HTTPX client with realistic settings."""
+    return httpx.AsyncClient(
+        http2=True,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        timeout=httpx.Timeout(30.0)
+    )
 
 
 def make_aiohttp_client() -> aiohttp.ClientSession:
-    """Create an AIOHTTP client."""
-    return aiohttp.ClientSession()
+    """Create an AIOHTTP client with realistic settings."""
+    conn = aiohttp.TCPConnector(
+        limit=100,
+        keepalive_timeout=75,
+        force_close=False,
+        enable_cleanup_closed=True
+    )
+    return aiohttp.ClientSession(connector=conn)
 
 
 # Request functions
@@ -99,14 +112,43 @@ class BenchmarkConfig:
     method: str = "GET"
     payload: Optional[Dict[str, Any]] = None
     headers: Optional[Dict[str, str]] = None
-    concurrency: int = 10
-    requests_per_client: int = 100
-    warmup_requests: int = 10
-    cooldown_seconds: int = 5
+    concurrency: int = 50  
+    requests_per_client: int = 1000 
+    warmup_requests: int = 100 
+    cooldown_seconds: int = 10
     timeout_seconds: int = 30
-    output_format: str = "table"  # table, json, csv
+    output_format: str = "table"
     output_file: Optional[str] = None
     clients: List[str] = None
+    use_realistic_delays: bool = True
+    max_connections: int = 100
+    keepalive_timeout: int = 75
+
+
+# Realistic request patterns
+REALISTIC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Accept": "text/html,application/json,*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
+}
+
+REALISTIC_PAYLOADS = [
+    {"query": "search term", "filters": {"category": "electronics", "price_range": [0, 1000]}},
+    {"user": {"id": 123, "preferences": {"theme": "dark", "notifications": True}}},
+    {"order": {"items": [{"id": 456, "quantity": 2}, {"id": 789, "quantity": 1}]}},
+    {"feedback": {"rating": 5, "comment": "Great service!", "timestamp": "2024-03-21T10:30:00Z"}},
+]
+
+async def simulate_realistic_delay() -> None:
+    """Simulate realistic delays between requests."""
+    # Exponential distribution with mean of 100ms
+    delay = random.expovariate(1/0.1)
+    # Cap maximum delay at 500ms
+    delay = min(delay, 0.5)
+    await asyncio.sleep(delay)
 
 
 @dataclass
@@ -138,14 +180,25 @@ class Benchmark:
         self.total_bytes = 0
         
     async def run_client(self, client: Any, url: str, progress_bar: tqdm) -> None:
-        """Run benchmark for a single client."""
+        """Run benchmark for a single client with realistic patterns."""
         for _ in range(self.config.requests_per_client):
+            if self.config.use_realistic_delays:
+                await simulate_realistic_delay()
+            
             start_time = time.time()
             try:
+                headers = {**REALISTIC_HEADERS}
+                if self.config.headers:
+                    headers.update(self.config.headers)
+                
                 if self.config.method == "GET":
-                    body = await self.request_func(client, url)
+                    body = await self.request_func(client, url, headers=headers)
                 else:
-                    body = await self.request_func(client, url, json=self.config.payload)
+                    # Randomly select a realistic payload
+                    payload = random.choice(REALISTIC_PAYLOADS)
+                    if self.config.payload:
+                        payload.update(self.config.payload)
+                    body = await self.request_func(client, url, json=payload, headers=headers)
                 
                 # Track response size
                 self.total_bytes += len(body)
@@ -356,13 +409,13 @@ def parse_args() -> BenchmarkConfig:
                       help="HTTP method to use")
     parser.add_argument("--payload", type=json.loads, help="JSON payload for POST/PUT requests")
     parser.add_argument("--headers", type=json.loads, help="JSON headers to include")
-    parser.add_argument("--concurrency", type=int, default=10,
+    parser.add_argument("--concurrency", type=int, default=50,
                       help="Number of concurrent clients")
-    parser.add_argument("--requests", type=int, default=100,
+    parser.add_argument("--requests", type=int, default=1000,
                       help="Number of requests per client")
-    parser.add_argument("--warmup", type=int, default=10,
+    parser.add_argument("--warmup", type=int, default=100,
                       help="Number of warmup requests")
-    parser.add_argument("--cooldown", type=int, default=5,
+    parser.add_argument("--cooldown", type=int, default=10,
                       help="Cooldown period in seconds")
     parser.add_argument("--timeout", type=int, default=30,
                       help="Request timeout in seconds")
@@ -372,6 +425,12 @@ def parse_args() -> BenchmarkConfig:
     parser.add_argument("--clients", nargs="+", default=["hyperhttp", "httpx", "aiohttp"],
                       choices=["hyperhttp", "httpx", "aiohttp"],
                       help="Clients to benchmark")
+    parser.add_argument("--no-realistic-delays", action="store_false", dest="use_realistic_delays",
+                      help="Disable realistic delays between requests")
+    parser.add_argument("--max-connections", type=int, default=100,
+                      help="Maximum number of connections per client")
+    parser.add_argument("--keepalive-timeout", type=int, default=75,
+                      help="Keepalive timeout in seconds")
     
     args = parser.parse_args()
     
@@ -387,7 +446,10 @@ def parse_args() -> BenchmarkConfig:
         timeout_seconds=args.timeout,
         output_format=args.format,
         output_file=args.output,
-        clients=args.clients
+        clients=args.clients,
+        use_realistic_delays=args.use_realistic_delays,
+        max_connections=args.max_connections,
+        keepalive_timeout=args.keepalive_timeout
     )
 
 

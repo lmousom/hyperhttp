@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - N/A
 
+## [1.1.0] - 2025-04-09
+
+### Added
+- Thread safety improvements across the codebase
+- Enhanced concurrency support for HTTP/2 connections
+
 ## [1.0.0] - 2025-04-05
 
 ### Added
@@ -43,5 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Test suite
 - CI/CD pipeline
 
-[Unreleased]: https://github.com/lmousom/hyperhttp/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/lmousom/hyperhttp/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/lmousom/hyperhttp/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/lmousom/hyperhttp/releases/tag/v1.0.0 
