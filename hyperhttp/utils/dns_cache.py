@@ -1,262 +1,187 @@
 """
-DNS caching utilities to minimize DNS resolution overhead.
+DNS cache and Happy Eyeballs v2 (RFC 8305) connector.
+
+``getaddrinfo`` doesn't expose DNS TTLs, so we treat the cache as a
+min/max bounded timestamp cache: fresh results live for at least ``min_ttl``
+and at most ``max_ttl``. IPv6 and IPv4 results are interleaved so that
+Happy Eyeballs races them fairly with the configured stagger (250ms by
+default).
 """
+
+from __future__ import annotations
 
 import asyncio
 import logging
 import socket
 import time
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-# Logger
-logger = logging.getLogger("hyperhttp.utils.dns_cache")
+from hyperhttp.exceptions import ConnectError, DNSError
+
+logger = logging.getLogger("hyperhttp.utils.dns")
+
+__all__ = ["DNSCache", "DNSResolver", "AddressInfo", "happy_eyeballs_connect"]
+
+
+class AddressInfo:
+    __slots__ = ("family", "sockaddr")
+
+    def __init__(self, family: int, sockaddr: Tuple[Any, ...]):
+        self.family = family
+        self.sockaddr = sockaddr
+
+    def __repr__(self) -> str:
+        return f"AddressInfo(family={self.family}, sockaddr={self.sockaddr})"
 
 
 class DNSCache:
-    """
-    Cache for DNS resolution results.
-    
-    This cache reduces DNS lookup overhead by storing resolution results
-    and respecting TTLs.
-    """
-    
-    def __init__(self, ttl: float = 300.0):
-        """
-        Initialize DNS cache.
-        
-        Args:
-            ttl: Default time-to-live for cache entries in seconds
-        """
-        self._cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
-        self._ttl = ttl
+    """Bounded-TTL cache of ``(host, port) → [AddressInfo...]``."""
+
+    def __init__(self, *, min_ttl: float = 10.0, max_ttl: float = 300.0) -> None:
+        self._cache: Dict[Tuple[str, int], Tuple[float, List[AddressInfo]]] = {}
+        self._min_ttl = min_ttl
+        self._max_ttl = max_ttl
         self._lock = asyncio.Lock()
-        
-    async def resolve(
-        self,
-        hostname: str,
-        port: int,
-    ) -> List[Dict[str, Any]]:
-        """
-        Resolve a hostname to addresses.
-        
-        Args:
-            hostname: Hostname to resolve
-            port: Port number
-            
-        Returns:
-            List of address information dictionaries
-        """
-        cache_key = (hostname, port)
-        
-        # Check cache first
+
+    async def resolve(self, host: str, port: int) -> List[AddressInfo]:
+        now = time.monotonic()
+        entry = self._cache.get((host, port))
+        if entry and entry[0] > now:
+            return entry[1]
+
+        addrs = await self._lookup(host, port)
         async with self._lock:
-            entry = self._cache.get(cache_key)
-            if entry and entry['expiry'] > time.monotonic():
-                logger.debug(f"DNS cache hit for {hostname}:{port}")
-                return entry['addresses']
-                
-        # Cache miss, do actual DNS resolution
-        logger.debug(f"DNS cache miss for {hostname}:{port}")
-        addresses = await self._do_dns_lookup(hostname, port)
-        
-        # Update cache
-        async with self._lock:
-            self._cache[cache_key] = {
-                'addresses': addresses,
-                'expiry': time.monotonic() + self._ttl
-            }
-            
-        return addresses
-        
-    async def _do_dns_lookup(
-        self,
-        hostname: str,
-        port: int,
-    ) -> List[Dict[str, Any]]:
-        """
-        Perform actual DNS resolution.
-        
-        Args:
-            hostname: Hostname to resolve
-            port: Port number
-            
-        Returns:
-            List of address information dictionaries
-        """
-        # Use getaddrinfo for proper dual-stack IPv4/IPv6 handling
-        loop = asyncio.get_event_loop()
+            self._cache[(host, port)] = (now + self._max_ttl, addrs)
+        return addrs
+
+    async def _lookup(self, host: str, port: int) -> List[AddressInfo]:
+        loop = asyncio.get_running_loop()
         try:
             infos = await loop.getaddrinfo(
-                hostname, port,
-                family=socket.AF_UNSPEC,
+                host,
+                port,
                 type=socket.SOCK_STREAM,
                 proto=socket.IPPROTO_TCP,
             )
-        except socket.gaierror as e:
-            logger.error(f"DNS resolution failed for {hostname}: {e}")
-            raise
-        
-        # Extract address info
-        addresses = []
-        for family, socktype, proto, canonname, sockaddr in infos:
-            addresses.append({
-                'family': family,
-                'sockaddr': sockaddr,
-                'socktype': socktype,
-                'proto': proto,
-            })
-            
-        return addresses
-    
+        except socket.gaierror as exc:
+            raise DNSError(f"DNS resolution failed for {host}: {exc}") from exc
+        result = [AddressInfo(family, sockaddr) for family, _, _, _, sockaddr in infos]
+        return _interleave_by_family(result)
+
     async def clear(self) -> None:
-        """Clear the entire cache."""
         async with self._lock:
             self._cache.clear()
-            
-    async def remove(self, hostname: str, port: int) -> None:
-        """
-        Remove a specific entry from the cache.
-        
-        Args:
-            hostname: Hostname to remove
-            port: Port number
-        """
+
+    async def invalidate(self, host: str, port: int) -> None:
         async with self._lock:
-            self._cache.pop((hostname, port), None)
-            
-    async def get_stats(self) -> Dict[str, Any]:
-        """
-        Get cache statistics.
-        
-        Returns:
-            Dictionary of cache statistics
-        """
-        async with self._lock:
-            now = time.monotonic()
-            return {
-                'total_entries': len(self._cache),
-                'valid_entries': sum(1 for entry in self._cache.values() 
-                                    if entry['expiry'] > now),
-                'expired_entries': sum(1 for entry in self._cache.values() 
-                                      if entry['expiry'] <= now),
-            }
+            self._cache.pop((host, port), None)
+
+
+def _interleave_by_family(addrs: List[AddressInfo]) -> List[AddressInfo]:
+    """Interleave IPv6 and IPv4 results for RFC 8305 ordering."""
+    ipv6 = [a for a in addrs if a.family == socket.AF_INET6]
+    ipv4 = [a for a in addrs if a.family == socket.AF_INET]
+    other = [a for a in addrs if a.family not in (socket.AF_INET, socket.AF_INET6)]
+    out: List[AddressInfo] = []
+    for i in range(max(len(ipv6), len(ipv4))):
+        if i < len(ipv6):
+            out.append(ipv6[i])
+        if i < len(ipv4):
+            out.append(ipv4[i])
+    out.extend(other)
+    return out
 
 
 class DNSResolver:
-    """
-    Resolver for optimized DNS lookups.
-    
-    This includes connection racing across multiple addresses to find
-    the fastest path to a host.
-    """
-    
-    def __init__(self, cache: Optional[DNSCache] = None):
-        """
-        Initialize DNS resolver.
-        
-        Args:
-            cache: Optional DNS cache to use
-        """
+    def __init__(self, cache: Optional[DNSCache] = None) -> None:
         self._cache = cache or DNSCache()
-        
-    async def resolve(
-        self,
-        hostname: str,
-        port: int,
-    ) -> List[Dict[str, Any]]:
-        """
-        Resolve a hostname to addresses.
-        
-        Args:
-            hostname: Hostname to resolve
-            port: Port number
-            
-        Returns:
-            List of address information dictionaries
-        """
-        return await self._cache.resolve(hostname, port)
-        
-    async def race_connection(
-        self,
-        hostname: str,
-        port: int,
-        timeout: float = 5.0,
-        connection_factory: Any = None,
-    ) -> Any:
-        """
-        Race connections to multiple addresses to find the fastest.
-        
-        Args:
-            hostname: Hostname to connect to
-            port: Port number
-            timeout: Connection timeout in seconds
-            connection_factory: Factory function for creating connections
-            
-        Returns:
-            The winning connection
-        """
-        if connection_factory is None:
-            raise ValueError("connection_factory is required")
-            
-        # Get all possible addresses
-        addresses = await self._cache.resolve(hostname, port)
-        
-        if not addresses:
-            raise ConnectionError(f"Could not resolve {hostname}")
-            
-        # Create a future to represent the winning connection
-        winner = asyncio.Future()
-        
-        # Create connections to each address in parallel
-        tasks = []
-        for addr in addresses:
-            task = asyncio.create_task(
-                self._connect_and_set_winner(
-                    addr, hostname, port, winner, connection_factory
+
+    async def resolve(self, host: str, port: int) -> List[AddressInfo]:
+        return await self._cache.resolve(host, port)
+
+    async def invalidate(self, host: str, port: int) -> None:
+        await self._cache.invalidate(host, port)
+
+
+ConnectFactory = Callable[[AddressInfo], Awaitable[Any]]
+
+
+async def happy_eyeballs_connect(
+    addresses: List[AddressInfo],
+    connect_factory: ConnectFactory,
+    *,
+    stagger: float = 0.25,
+    timeout: Optional[float] = None,
+) -> Any:
+    """Race ``connect_factory`` across addresses with RFC 8305 stagger.
+
+    Returns the first successful result. All other pending attempts are
+    cancelled. If every attempt fails, the last exception is raised.
+    """
+    if not addresses:
+        raise DNSError("No addresses to connect to")
+
+    loop = asyncio.get_running_loop()
+    winner: "asyncio.Future[Any]" = loop.create_future()
+    tasks: List[asyncio.Task[Any]] = []
+    exceptions: List[BaseException] = []
+
+    async def attempt(addr: AddressInfo, delay: float) -> None:
+        if delay:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+        if winner.done():
+            return
+        try:
+            conn = await connect_factory(addr)
+        except BaseException as exc:  # noqa: BLE001 - we want broad here
+            exceptions.append(exc)
+            if len(exceptions) == len(addresses) and not winner.done():
+                winner.set_exception(
+                    _first_real_exception(exceptions)
+                    or ConnectError("All connection attempts failed")
                 )
-            )
-            tasks.append(task)
-            
-        try:
-            # Wait for the first successful connection or timeout
-            return await asyncio.wait_for(winner, timeout)
-        finally:
-            # Cancel all other connection attempts
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-                    
-    async def _connect_and_set_winner(
-        self,
-        addr: Dict[str, Any],
-        hostname: str,
-        port: int,
-        winner: asyncio.Future,
-        connection_factory: Any,
-    ) -> None:
-        """
-        Connect to a specific address and set as winner if first to succeed.
-        
-        Args:
-            addr: Address information dictionary
-            hostname: Hostname for connection
-            port: Port number
-            winner: Future to set with winning connection
-            connection_factory: Factory function for creating connections
-        """
-        try:
-            # Create connection to specific address
-            conn = await connection_factory(
-                hostname, port, 
-                family=addr['family'],
-                sockaddr=addr['sockaddr'],
-            )
-            
-            # Set as winner if not already won
-            if not winner.done():
-                winner.set_result(conn)
-        except Exception as e:
-            # Connection failed, only propagate if no winners
-            if not winner.done() and all(t.done() for t in asyncio.all_tasks() 
-                                       if t != asyncio.current_task()):
-                winner.set_exception(e)
+            return
+        if not winner.done():
+            winner.set_result(conn)
+        else:
+            _close_quietly(conn)
+
+    for idx, addr in enumerate(addresses):
+        tasks.append(asyncio.create_task(attempt(addr, stagger * idx)))
+
+    try:
+        if timeout is not None:
+            return await asyncio.wait_for(asyncio.shield(winner), timeout)
+        return await winner
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        # Await cancellation so we don't leak tasks.
+        for task in tasks:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def _first_real_exception(excs: List[BaseException]) -> Optional[BaseException]:
+    for exc in excs:
+        if not isinstance(exc, asyncio.CancelledError):
+            return exc
+    return None
+
+
+def _close_quietly(obj: Any) -> None:
+    try:
+        close = getattr(obj, "close", None)
+        if close is None:
+            return
+        result = close()
+        if asyncio.iscoroutine(result):
+            asyncio.ensure_future(result)
+    except Exception:
+        pass

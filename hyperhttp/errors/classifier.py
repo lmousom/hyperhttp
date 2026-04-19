@@ -8,6 +8,22 @@ import socket
 import time
 from typing import Dict, Any, Optional, Type, Set, Union
 
+from hyperhttp.exceptions import (
+    ConnectError,
+    ConnectTimeout,
+    DNSError,
+    LocalProtocolError,
+    PoolTimeout,
+    ProtocolError,
+    ReadError,
+    ReadTimeout,
+    RemoteProtocolError,
+    TimeoutException,
+    TLSError,
+    WriteError,
+    WriteTimeout,
+)
+
 
 class ErrorClassifier:
     """
@@ -30,31 +46,44 @@ class ErrorClassifier:
         'FATAL': 90       # Unrecoverable errors
     }
     
-    # Mapping of exception types to categories
+    # Mapping of exception types to categories. Order matters — the first
+    # ``isinstance`` match wins for subclasses, so keep more-specific classes
+    # ahead of generic bases (e.g. ``Exception`` last).
     ERROR_MAPPING: Dict[Type[Exception], str] = {
-        # Network errors
+        # hyperhttp typed exceptions (most specific first)
+        ReadTimeout: 'TIMEOUT',
+        WriteTimeout: 'TIMEOUT',
+        ConnectTimeout: 'TIMEOUT',
+        PoolTimeout: 'TIMEOUT',
+        TimeoutException: 'TIMEOUT',
+        DNSError: 'DNS',
+        TLSError: 'TLS',
+        LocalProtocolError: 'PROTOCOL',
+        RemoteProtocolError: 'PROTOCOL',
+        ProtocolError: 'PROTOCOL',
+        ConnectError: 'CONNECTION',
+        ReadError: 'TRANSIENT',
+        WriteError: 'TRANSIENT',
+
+        # stdlib network errors
         ConnectionResetError: 'TRANSIENT',
         ConnectionAbortedError: 'TRANSIENT',
         ConnectionRefusedError: 'CONNECTION',
         ConnectionError: 'CONNECTION',
-        
-        # Timeout errors
+
+        # stdlib timeouts
         asyncio.TimeoutError: 'TIMEOUT',
         TimeoutError: 'TIMEOUT',
         socket.timeout: 'TIMEOUT',
-        
-        # TLS errors
+
+        # stdlib TLS / DNS
         ssl.SSLError: 'TLS',
         ssl.CertificateError: 'TLS',
-        
-        # DNS errors
         socket.gaierror: 'DNS',
-        
-        # Protocol errors
+
+        # Low-confidence fallbacks
         UnicodeError: 'PROTOCOL',
-        ValueError: 'PROTOCOL',  # Often from malformed responses
-        
-        # Generic errors (will be refined based on content)
+        ValueError: 'PROTOCOL',
         OSError: 'CONNECTION',
         IOError: 'CONNECTION',
         Exception: 'FATAL',

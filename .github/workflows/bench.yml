@@ -1,0 +1,72 @@
+name: Benchmark
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install hyperhttp + benchmark deps
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[bench,speed]"
+
+    - name: Warm up
+      run: |
+        python examples/benchmark_local.py \
+          --requests 200 --concurrency 16 \
+          --sizes 200 \
+          --clients hyperhttp > /dev/null
+
+    - name: Run benchmark
+      run: |
+        python examples/benchmark_local.py \
+          --requests 2000 --concurrency 64 \
+          --sizes 200,10240,1048576 \
+          --clients hyperhttp,aiohttp,httpx \
+          --json bench_results.json | tee bench_output.txt
+
+    - name: Prepare PR comment body
+      id: comment
+      run: |
+        {
+          echo 'body<<__EOF__'
+          echo '### hyperhttp benchmark'
+          echo ''
+          echo 'Local aiohttp loopback server; 2 000 requests per (client, size), concurrency 64.'
+          echo ''
+          echo '```'
+          # Extract just the results table from the benchmark output
+          tail -n +$(grep -n '^client' bench_output.txt | head -1 | cut -d: -f1) bench_output.txt
+          echo '```'
+          echo '__EOF__'
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Post benchmark results to PR
+      if: github.event_name == 'pull_request'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: bench-results
+        message: ${{ steps.comment.outputs.body }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-results
+        path: |
+          bench_output.txt
+          bench_results.json

@@ -1,18 +1,32 @@
 """
 Connection management for HyperHTTP.
 
-This package handles low-level connection creation, pooling, and lifecycle
-management to maximize connection reuse and minimize latency.
+Public surface:
+
+- ``Transport`` (abstract): one TCP/TLS pipe; speaks H1 or H2.
+- ``H1Transport`` / ``H2Transport``: protocol-specific transports.
+- ``ConnectionPool`` / ``ConnectionPoolManager``: per-host and global pools.
+- ``connect_transport``: open a transport with ALPN-aware dispatch.
 """
 
-from hyperhttp.connection.base import Connection, ConnectionMetadata
-from hyperhttp.connection.pool import ConnectionPool, ConnectionPoolManager
-from hyperhttp.connection.manager import ConnectionManager
+from hyperhttp.connection.pool import (
+    ConnectionPool,
+    ConnectionPoolManager,
+    PoolOptions,
+)
+from hyperhttp.connection.transport import (
+    H1Transport,
+    RawResponse,
+    Transport,
+    connect_transport,
+)
 
 __all__ = [
-    "Connection",
-    "ConnectionMetadata",
+    "Transport",
+    "H1Transport",
+    "RawResponse",
     "ConnectionPool",
     "ConnectionPoolManager",
-    "ConnectionManager",
+    "PoolOptions",
+    "connect_transport",
 ]

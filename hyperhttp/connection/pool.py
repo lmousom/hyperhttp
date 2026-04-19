@@ -1,425 +1,424 @@
 """
-Connection pooling system for efficient connection reuse.
+Connection pool.
+
+Design goals:
+
+- Per-host pool + global cap enforced by ``ConnectionPoolManager``.
+- HTTP/2 transports are shared; an HTTP/2 connection is only "busy" when its
+  peer-advertised ``MAX_CONCURRENT_STREAMS`` limit is saturated.
+- HTTP/1.1 transports are dedicated — at most one in-flight request per
+  transport. They go on an idle deque when released and are reused LIFO.
+- Waiter fairness: waiters live in a deque of futures and are fulfilled in
+  FIFO order. Release hands off directly to the first un-cancelled waiter.
+- Global cap ties into request queueing: if we'd exceed the global cap we
+  wait for *any* pool to free a slot.
+
+The pool is purely async and relies on the event loop's cooperative
+scheduling for correctness — it does not use threading locks.
 """
 
+from __future__ import annotations
+
 import asyncio
-import collections
 import logging
 import time
-import urllib.parse
-from typing import Dict, Deque, Optional, Set, List, Callable
+from collections import deque
+from typing import Any, Deque, Dict, Iterable, List, Optional
 
-from hyperhttp.connection.base import Connection, ConnectionMetadata
-from hyperhttp.protocol.http1 import HTTP1Connection
-from hyperhttp.protocol.http2 import HTTP2Connection
+from hyperhttp._url import URL
+from hyperhttp.connection.transport import Transport, connect_transport
+from hyperhttp.exceptions import PoolClosed, PoolTimeout
+from hyperhttp.utils.buffer_pool import BufferPool
+from hyperhttp.utils.dns_cache import DNSResolver
 
-# Type for connection factories
-ConnectionFactory = Callable[..., Connection]
+logger = logging.getLogger("hyperhttp.pool")
 
-# Logger
-logger = logging.getLogger("hyperhttp.connection.pool")
+__all__ = ["ConnectionPool", "ConnectionPoolManager", "PoolOptions"]
 
 
-class PoolTimeoutError(Exception):
-    """Exception raised when a connection cannot be acquired within the timeout."""
-    pass
+class PoolOptions:
+    """Configuration bundle for pool + transport creation."""
+
+    __slots__ = (
+        "max_connections",
+        "max_connections_per_host",
+        "keepalive_expiry",
+        "http2",
+        "verify",
+        "cert",
+        "ssl_context",
+        "connect_timeout",
+        "happy_eyeballs_delay",
+    )
+
+    def __init__(
+        self,
+        *,
+        max_connections: int = 100,
+        max_connections_per_host: int = 20,
+        keepalive_expiry: float = 120.0,
+        http2: bool = True,
+        verify: Any = True,
+        cert: Any = None,
+        ssl_context: Any = None,
+        connect_timeout: Optional[float] = 10.0,
+        happy_eyeballs_delay: float = 0.25,
+    ) -> None:
+        self.max_connections = max_connections
+        self.max_connections_per_host = max_connections_per_host
+        self.keepalive_expiry = keepalive_expiry
+        self.http2 = http2
+        self.verify = verify
+        self.cert = cert
+        self.ssl_context = ssl_context
+        self.connect_timeout = connect_timeout
+        self.happy_eyeballs_delay = happy_eyeballs_delay
 
 
 class ConnectionPool:
-    """
-    Pool of connections to a specific host.
-    
-    This manages connections to a single host (hostname:port combination),
-    handling connection creation, reuse, and lifecycle.
-    """
-    
+    """Per-host pool of transports."""
+
     def __init__(
         self,
-        hostname: str,
+        host: str,
         port: int,
         scheme: str,
-        min_connections: int = 0,
-        max_connections: int = 20,
-        max_keepalive: float = 120,
-        ttl_check_interval: float = 15,
-    ):
-        self._hostname = hostname
+        *,
+        options: PoolOptions,
+        dns: DNSResolver,
+        buffer_pool: BufferPool,
+        manager: "ConnectionPoolManager",
+    ) -> None:
+        self._host = host
         self._port = port
         self._scheme = scheme
-        self._use_tls = scheme == "https"
-        
-        # Pool configuration
-        self._min_connections = min_connections
-        self._max_connections = max_connections
-        self.max_idle_time = max_keepalive
-        self.health_check_interval = ttl_check_interval
-        
-        # Connection tracking
-        self._idle_connections: Deque[Connection] = collections.deque()
-        self._active_connections: Set[Connection] = set()
-        self._pending_connections = 0
-        
-        # For connection requests when pool is exhausted
-        self._waiting_queue: asyncio.Queue = asyncio.Queue()
-        
-        # Connection factory based on protocol
-        self._factory = self._create_connection_factory()
-        
-        # Host key for pool lookup
-        self.host_key = f"{hostname}:{port}"
-        
-        # Validation tracking
-        self._last_validation_time = time.monotonic()
-        self._validation_success_count = 0
-        self._validation_failure_count = 0
-        
-    def _create_connection_factory(self) -> ConnectionFactory:
-        """Create a connection factory for this pool."""
-        if self._scheme == "https":
-            return lambda: HTTP2Connection(
-                host=self._hostname,
-                port=self._port,
-                use_tls=True,
-            )
-        else:
-            return lambda: HTTP1Connection(
-                host=self._hostname,
-                port=self._port,
-                use_tls=False,
-            )
-    
-    async def acquire(self, timeout: Optional[float] = 10.0) -> Connection:
-        """
-        Acquire a connection from the pool.
-        
-        Args:
-            timeout: Maximum time to wait for a connection
-            
-        Returns:
-            Connection object
-            
-        Raises:
-            PoolTimeoutError: If no connection is available within the timeout
-        """
-        # Fast path: get idle connection if available
-        while self._idle_connections:
-            conn = self._idle_connections.popleft()
-            
-            # Validate connection is still usable
-            if await self._validate_connection(conn):
-                self._active_connections.add(conn)
-                return conn
-                
-            # Connection was stale, discard and try next
-            await self._close_connection(conn)
-        
-        # Medium path: create new connection if under limit
-        total_connections = (len(self._active_connections) + 
-                           len(self._idle_connections) + 
-                           self._pending_connections)
-                           
-        if total_connections < self._max_connections:
-            self._pending_connections += 1
+        self._options = options
+        self._dns = dns
+        self._buffer_pool = buffer_pool
+        self._manager = manager
+
+        self._idle: Deque[Transport] = deque()
+        self._active: Dict[int, Transport] = {}
+        self._waiters: Deque["asyncio.Future[Transport]"] = deque()
+        self._pending_connects = 0
+        self._closed = False
+        # Serialize the *first* connect for HTTPS pools so concurrent waiters
+        # can share the eventual H2 multiplex rather than racing into N
+        # separate TLS handshakes only to discover ALPN picked H2.
+        self._probing_alpn = scheme == "https" and options.http2
+        self._probe_done: Optional["asyncio.Event"] = None
+
+    # -- public ------------------------------------------------------------
+
+    @property
+    def host_port(self) -> str:
+        default = 443 if self._scheme == "https" else 80
+        if self._port == default:
+            return self._host
+        return f"{self._host}:{self._port}"
+
+    @property
+    def total(self) -> int:
+        return len(self._active) + len(self._idle) + self._pending_connects
+
+    async def acquire(self, url: URL, *, timeout: Optional[float] = None) -> Transport:
+        if self._closed:
+            raise PoolClosed(f"Pool for {self.host_port} is closed")
+
+        # Fast path: reusable idle transport.
+        transport = self._take_idle()
+        if transport is not None:
+            self._active[id(transport)] = transport
+            return transport
+
+        # HTTP/2 multiplexing: scan active transports for available streams.
+        for transport in self._active.values():
+            if (
+                transport.http_version == "HTTP/2"
+                and transport.reusable
+                and transport.in_flight < transport.max_concurrent
+            ):
+                return transport
+
+        # HTTPS + h2 enabled: the first connect for this host races ALPN. If
+        # the server picks H2, a single connection serves everyone; if it picks
+        # H1, we'll fall through to the normal per-request path. So block
+        # sibling waiters until the probe resolves.
+        if self._probing_alpn and self._probe_done is not None:
             try:
-                conn = await self._create_connection()
-                self._active_connections.add(conn)
-                return conn
-            finally:
-                self._pending_connections -= 1
-        
-        # Slow path: wait for a connection to be released
-        future = asyncio.Future()
-        await self._waiting_queue.put(future)
-        
-        # Set timeout
-        if timeout is not None:
+                await asyncio.wait_for(self._probe_done.wait(), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise PoolTimeout(
+                    f"Timed out waiting for ALPN probe to {self.host_port}"
+                ) from exc
+            # Retry the acquire logic post-probe.
+            return await self.acquire(url, timeout=timeout)
+
+        # Create a new connection if we have headroom (per-host and global).
+        if self._can_create_new():
+            probe_event: Optional[asyncio.Event] = None
+            if self._probing_alpn and self._probe_done is None:
+                probe_event = asyncio.Event()
+                self._probe_done = probe_event
+
+            await self._manager._reserve_global()
+            self._pending_connects += 1
             try:
-                return await asyncio.wait_for(future, timeout)
-            except asyncio.TimeoutError:
-                # Remove from queue if still waiting
-                future.cancel()
-                raise PoolTimeoutError(
-                    f"Timeout waiting for connection to {self._hostname}:{self._port}"
-                )
-        return await future
-    
-    def release(self, connection: Connection, recycle: bool = True) -> None:
-        """
-        Release a connection back to the pool.
-        
-        Args:
-            connection: The connection to release
-            recycle: Whether to recycle the connection or close it
-        """
-        # Remove from active set
-        self._active_connections.discard(connection)
-        
-        if not recycle or not connection.is_reusable():
-            # Close non-reusable connections
-            asyncio.create_task(self._close_connection(connection))
-            return
-            
-        # Update connection metadata
-        connection.metadata.idle_since = time.monotonic()
-        
-        # Check if anyone is waiting for a connection
-        if not self._waiting_queue.empty():
-            future = asyncio.create_task(self._waiting_queue.get())
-            future.add_done_callback(
-                lambda f: self._fulfill_waiting_request(f.result(), connection)
-            )
-        else:
-            # Return to idle pool
-            self._idle_connections.append(connection)
-    
-    def _fulfill_waiting_request(self, future: asyncio.Future, connection: Connection) -> None:
-        """Fulfill a waiting connection request."""
-        if not future.cancelled():
-            self._active_connections.add(connection)
-            future.set_result(connection)
-        else:
-            # Request was cancelled, return connection to pool
-            self._idle_connections.append(connection)
-    
-    async def _create_connection(self) -> Connection:
-        """Create a new connection to the host."""
-        conn = self._factory()
+                transport = await self._create_transport(url)
+            except BaseException:
+                self._pending_connects -= 1
+                self._manager._release_global()
+                if probe_event is not None:
+                    self._probe_done = None
+                    probe_event.set()
+                raise
+            self._pending_connects -= 1
+            self._active[id(transport)] = transport
+            if probe_event is not None:
+                # If ALPN chose HTTP/1.1, further callers should not block —
+                # disable the probe gate permanently for this host.
+                if transport.http_version != "HTTP/2":
+                    self._probing_alpn = False
+                self._probe_done = None
+                probe_event.set()
+            return transport
+
+        # Otherwise queue up and wait.
+        waiter: "asyncio.Future[Transport]" = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
         try:
-            await conn.connect()
-            return conn
-        except Exception as e:
-            logger.warning(f"Failed to create connection to {self.host_key}: {e}")
-            await conn.close()
+            if timeout is not None:
+                return await asyncio.wait_for(asyncio.shield(waiter), timeout)
+            return await waiter
+        except asyncio.TimeoutError as exc:
+            waiter.cancel()
+            self._prune_cancelled_waiters()
+            raise PoolTimeout(
+                f"Timed out waiting for a connection to {self.host_port}"
+            ) from exc
+        except BaseException:
+            waiter.cancel()
+            self._prune_cancelled_waiters()
             raise
-    
-    async def _validate_connection(self, connection: Connection) -> bool:
+
+    def release(self, transport: Transport, *, discard: bool = False) -> None:
+        """Return a transport to the pool.
+
+        For HTTP/1.1 the transport is placed back on the idle deque (unless
+        ``discard`` is set or it's no longer reusable). For HTTP/2 the
+        transport remains active if it still has capacity.
         """
-        Validate that a connection is still usable.
-        
-        Args:
-            connection: Connection to validate
-            
-        Returns:
-            True if the connection is valid, False otherwise
-        """
-        # Check if connection is marked as non-reusable
-        if connection.metadata.marked_for_close:
+        tid = id(transport)
+        if transport.http_version == "HTTP/2":
+            if discard or transport.closed or not transport.reusable:
+                self._active.pop(tid, None)
+                asyncio.create_task(self._close_transport(transport))
+                self._manager._release_global()
+            if self._waiters:
+                self._wake_waiters_h2()
+            return
+
+        # HTTP/1.1: transport is done with its single request.
+        self._active.pop(tid, None)
+        if discard or transport.closed or not transport.reusable:
+            asyncio.create_task(self._close_transport(transport))
+            self._manager._release_global()
+            if self._waiters:
+                self._wake_waiters_h2()  # try H2 active for waiters anyway
+            return
+
+        if self._waiters and self._hand_off_to_waiter(transport):
+            return
+        self._idle.append(transport)
+
+    async def aclose(self) -> None:
+        self._closed = True
+        for waiter in self._waiters:
+            if not waiter.done():
+                waiter.set_exception(PoolClosed(f"Pool for {self.host_port} is closed"))
+        self._waiters.clear()
+        for transport in list(self._idle):
+            await self._close_transport(transport)
+            self._manager._release_global()
+        self._idle.clear()
+        for transport in list(self._active.values()):
+            await self._close_transport(transport)
+            self._manager._release_global()
+        self._active.clear()
+
+    # -- helpers -----------------------------------------------------------
+
+    def _take_idle(self) -> Optional[Transport]:
+        now = time.monotonic()
+        expiry = self._options.keepalive_expiry
+        while self._idle:
+            transport = self._idle.pop()  # LIFO for locality
+            if transport.closed or not transport.reusable:
+                asyncio.create_task(self._close_transport(transport))
+                self._manager._release_global()
+                continue
+            last_used = getattr(transport, "_last_used", now)
+            if expiry and (now - last_used) > expiry:
+                asyncio.create_task(self._close_transport(transport))
+                self._manager._release_global()
+                continue
+            return transport
+        return None
+
+    def _can_create_new(self) -> bool:
+        if self.total >= self._options.max_connections_per_host:
             return False
-            
-        # Adaptive validation based on success rate
-        current_time = time.monotonic()
-        time_since_last_validation = current_time - self._last_validation_time
-        
-        # Calculate validation success rate
-        total_validations = self._validation_success_count + self._validation_failure_count
-        if total_validations > 0:
-            success_rate = self._validation_success_count / total_validations
-        else:
-            success_rate = 1.0
-            
-        # Skip validation if:
-        # 1. Connection was recently used (within 5 seconds)
-        # 2. High success rate (>95%) and not too much time passed
-        if (current_time - connection.metadata.last_used < 5 or
-            (success_rate > 0.95 and time_since_last_validation < 30)):
-            return True
-            
-        # Update last validation time
-        self._last_validation_time = current_time
-        
-        try:
-            # Perform actual validation
-            is_healthy = await connection.check_health()
-            
-            # Update validation stats
-            if is_healthy:
-                self._validation_success_count += 1
-            else:
-                self._validation_failure_count += 1
-                
-            return is_healthy
-        except Exception:
-            self._validation_failure_count += 1
+        if self._manager.total_connections >= self._options.max_connections:
             return False
-    
-    async def _close_connection(self, connection: Connection) -> None:
-        """Close a connection and clean up resources."""
-        try:
-            await connection.close()
-        except Exception as e:
-            logger.debug(f"Error closing connection: {e}")
-    
-    async def close(self) -> None:
-        """Close all connections in the pool."""
-        # Close all idle connections
-        while self._idle_connections:
-            conn = self._idle_connections.popleft()
-            await self._close_connection(conn)
-            
-        # Close all active connections
-        for conn in list(self._active_connections):
-            await self._close_connection(conn)
-            
-        # Clear the waiting queue
-        while not self._waiting_queue.empty():
-            future = await self._waiting_queue.get()
-            if not future.done():
-                future.set_exception(ConnectionError("Connection pool closed"))
-    
-    def get_idle_connections(self) -> List[Connection]:
-        """Get all idle connections in the pool."""
-        return list(self._idle_connections)
-    
-    def get_all_active_connections(self) -> List[Connection]:
-        """Get all active connections in the pool."""
-        return list(self._active_connections)
-    
-    def remove_connection(self, connection: Connection) -> None:
-        """Remove a connection from the pool without closing it."""
-        self._idle_connections = collections.deque(
-            conn for conn in self._idle_connections if conn is not connection
+        return True
+
+    async def _create_transport(self, url: URL) -> Transport:
+        return await connect_transport(
+            url,
+            dns=self._dns,
+            ssl_context=self._options.ssl_context,
+            verify=self._options.verify,
+            cert=self._options.cert,
+            connect_timeout=self._options.connect_timeout,
+            happy_eyeballs_delay=self._options.happy_eyeballs_delay,
+            buffer_pool=self._buffer_pool,
+            enable_http2=self._options.http2,
         )
-        self._active_connections.discard(connection)
-    
-    @property
-    def total_connections(self) -> int:
-        """Get the total number of connections in the pool."""
-        return len(self._idle_connections) + len(self._active_connections) + self._pending_connections
-    
-    @property
-    def idle_connections(self) -> int:
-        """Get the number of idle connections in the pool."""
-        return len(self._idle_connections)
-    
-    @property
-    def active_connections(self) -> int:
-        """Get the number of active connections in the pool."""
-        return len(self._active_connections)
+
+    def _hand_off_to_waiter(self, transport: Transport) -> bool:
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if waiter.cancelled() or waiter.done():
+                continue
+            self._active[id(transport)] = transport
+            waiter.set_result(transport)
+            return True
+        return False
+
+    def _wake_waiters_h2(self) -> None:
+        """For HTTP/2 fan-out: hand any waiter to an active conn with capacity."""
+        if not self._waiters:
+            return
+        for transport in self._active.values():
+            if transport.http_version != "HTTP/2":
+                continue
+            if transport.reusable and transport.in_flight < transport.max_concurrent:
+                while self._waiters:
+                    waiter = self._waiters.popleft()
+                    if waiter.cancelled() or waiter.done():
+                        continue
+                    waiter.set_result(transport)
+                    return
+
+    def _prune_cancelled_waiters(self) -> None:
+        self._waiters = deque(w for w in self._waiters if not (w.cancelled() or w.done()))
+
+    async def _close_transport(self, transport: Transport) -> None:
+        try:
+            await transport.aclose()
+        except Exception:
+            pass
 
 
 class ConnectionPoolManager:
-    """
-    Manager for multiple connection pools.
-    
-    This manages pools for different hosts, handling connection acquisition
-    and lifecycle across all of them.
-    """
-    
+    """Multi-host connection pool manager with a global connection cap."""
+
     def __init__(
         self,
-        max_connections: int = 200,
-        max_connections_per_host: int = 20,
-        max_keepalive: float = 120,
-    ):
-        # Host-specific pools (hostname:port → pool)
-        self._host_pools: Dict[str, ConnectionPool] = {}
-        
-        # Pool configuration
-        self._max_connections = max_connections
-        self._max_connections_per_host = max_connections_per_host
-        self._max_keepalive = max_keepalive
-        
-        # Connection tracking
-        self._total_connections = 0
-        
-    async def get_connection(self, url: str, timeout: float = 10.0) -> Connection:
-        """
-        Get a connection for the specified URL.
-        
-        Args:
-            url: URL to connect to
-            timeout: Maximum time to wait for a connection
-            
-        Returns:
-            Connection object
-            
-        Raises:
-            PoolTimeoutError: If no connection is available within the timeout
-        """
-        # Parse URL to get host, port, and protocol
-        parsed = urllib.parse.urlparse(url)
-        hostname = parsed.hostname or ""
-        port = parsed.port or self._get_default_port(parsed.scheme)
-        scheme = parsed.scheme
-        
-        host_key = f"{hostname}:{port}"
-        
-        # Get or create host-specific pool
-        pool = await self._get_or_create_pool(hostname, port, scheme)
-        
-        # Get connection from host pool
-        return await pool.acquire(timeout)
-    
-    def release_connection(self, connection: Connection, recycle: bool = True) -> None:
-        """
-        Release a connection back to its pool.
-        
-        Args:
-            connection: Connection to release
-            recycle: Whether to recycle the connection or close it
-        """
-        host_key = connection.host_key
-        if host_key in self._host_pools:
-            self._host_pools[host_key].release(connection, recycle)
-    
-    async def _get_or_create_pool(
-        self, hostname: str, port: int, scheme: str
-    ) -> ConnectionPool:
-        """
-        Get or create a connection pool for the specified host.
-        
-        Args:
-            hostname: Target hostname
-            port: Target port
-            scheme: URL scheme (http or https)
-            
-        Returns:
-            ConnectionPool for the host
-        """
-        host_key = f"{hostname}:{port}"
-        
-        if host_key not in self._host_pools:
-            # Create pool with appropriate settings for this host
-            pool = ConnectionPool(
-                hostname=hostname,
-                port=port,
-                scheme=scheme,
-                max_connections=self._max_connections_per_host,
-                max_keepalive=self._max_keepalive,
-            )
-            self._host_pools[host_key] = pool
-            
-        return self._host_pools[host_key]
-    
-    def _get_default_port(self, scheme: str) -> int:
-        """Get the default port for a URL scheme."""
-        if scheme == "https":
-            return 443
-        return 80
-    
-    async def close(self) -> None:
-        """Close all connections and pools."""
-        # Close all host pools
-        for pool in list(self._host_pools.values()):
-            await pool.close()
-            
-        self._host_pools.clear()
-    
-    def get_all_pools(self) -> List[ConnectionPool]:
-        """Get all connection pools."""
-        return list(self._host_pools.values())
-    
+        *,
+        options: Optional[PoolOptions] = None,
+        dns: Optional[DNSResolver] = None,
+        buffer_pool: Optional[BufferPool] = None,
+    ) -> None:
+        self._options = options or PoolOptions()
+        self._dns = dns or DNSResolver()
+        self._buffer_pool = buffer_pool or BufferPool()
+        self._pools: Dict[str, ConnectionPool] = {}
+        self._total_slots = 0
+        self._global_waiters: Deque["asyncio.Future[None]"] = deque()
+        self._closed = False
+
+    # -- global slot accounting -------------------------------------------
+
     @property
     def total_connections(self) -> int:
-        """Get the total number of connections across all pools."""
-        return sum(pool.total_connections for pool in self._host_pools.values())
-    
-    @property
-    def idle_connections(self) -> int:
-        """Get the total number of idle connections across all pools."""
-        return sum(pool.idle_connections for pool in self._host_pools.values())
-    
-    @property
-    def active_connections(self) -> int:
-        """Get the total number of active connections across all pools."""
-        return sum(pool.active_connections for pool in self._host_pools.values())
+        return self._total_slots
+
+    async def _reserve_global(self) -> None:
+        while self._total_slots >= self._options.max_connections and not self._closed:
+            fut: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+            self._global_waiters.append(fut)
+            try:
+                await fut
+            except BaseException:
+                if not fut.done():
+                    fut.cancel()
+                raise
+        if self._closed:
+            raise PoolClosed("Pool manager is closed")
+        self._total_slots += 1
+
+    def _release_global(self) -> None:
+        if self._total_slots > 0:
+            self._total_slots -= 1
+        while self._global_waiters:
+            waiter = self._global_waiters.popleft()
+            if not waiter.done() and not waiter.cancelled():
+                waiter.set_result(None)
+                break
+
+    # -- public API --------------------------------------------------------
+
+    async def acquire(self, url: URL, *, timeout: Optional[float] = None) -> Transport:
+        if self._closed:
+            raise PoolClosed("Pool manager is closed")
+        key = f"{url.scheme}://{url.host_port}"
+        pool = self._pools.get(key)
+        if pool is None:
+            pool = ConnectionPool(
+                host=url.host,
+                port=url.port,
+                scheme=url.scheme,
+                options=self._options,
+                dns=self._dns,
+                buffer_pool=self._buffer_pool,
+                manager=self,
+            )
+            self._pools[key] = pool
+        return await pool.acquire(url, timeout=timeout)
+
+    def release(self, transport: Transport, *, discard: bool = False) -> None:
+        # Find the pool that owns this transport.
+        for pool in self._pools.values():
+            if id(transport) in pool._active or transport in pool._idle:  # type: ignore[operator]
+                pool.release(transport, discard=discard)
+                return
+        # Transport wasn't tracked — close defensively.
+        asyncio.create_task(transport.aclose())
+
+    async def aclose(self) -> None:
+        self._closed = True
+        pools = list(self._pools.values())
+        self._pools.clear()
+        for pool in pools:
+            await pool.aclose()
+        for waiter in self._global_waiters:
+            if not waiter.done():
+                waiter.set_exception(PoolClosed("Pool manager is closed"))
+        self._global_waiters.clear()
+
+    def pools(self) -> Iterable[ConnectionPool]:
+        return self._pools.values()
+
+    def stats(self) -> Dict[str, Dict[str, int]]:
+        """Return a per-host snapshot of connection counts."""
+        return {
+            pool.host_port: {
+                "idle": len(pool._idle),
+                "active": len(pool._active),
+                "pending": pool._pending_connects,
+                "waiters": len(pool._waiters),
+                "total_connections": pool.total,
+            }
+            for pool in self._pools.values()
+        }

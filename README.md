@@ -5,113 +5,76 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Documentation Status](https://readthedocs.org/projects/hyperhttp/badge/?version=latest)](https://hyperhttp.readthedocs.io/en/latest/?badge=latest)
 [![Tests](https://github.com/lmousom/hyperhttp/actions/workflows/tests.yml/badge.svg)](https://github.com/lmousom/hyperhttp/actions/workflows/tests.yml)
-[![Code Coverage](https://codecov.io/gh/lmousom/hyperhttp/branch/main/graph/badge.svg)](https://codecov.io/gh/lmousom/hyperhttp)
 
-HyperHTTP is a revolutionary HTTP client library for Python that achieves unprecedented performance while being written entirely in pure Python. Unlike other popular libraries that rely on C extensions or CPython bindings (like `requests` and `httpx`), HyperHTTP demonstrates that Python can be blazingly fast when designed with performance in mind.
+A fast, correct async HTTP client for Python. HTTP/1.1 and HTTP/2, built on `asyncio`.
 
-Through innovative architecture and optimization techniques, HyperHTTP delivers:
-- 15% faster than `aiohttp` and 20% faster than `httpx` in real-world benchmarks
-- 4.5x lower memory consumption than `httpx` and 4.4x lower than `aiohttp`
-- Native HTTP/2 support with optimized stream handling
-- Zero external dependencies for core functionality
+HyperHTTP is designed for services that make a lot of outbound HTTP calls — API gateways, crawlers, load generators, backend-to-backend traffic — where throughput, tail latency, and memory behaviour under concurrency all matter.
 
-Built with modern Python features and a focus on asyncio, HyperHTTP proves that pure Python implementations can outperform C-based alternatives when designed with performance as a first-class concern. It's the perfect choice for high-throughput applications where speed and resource efficiency matter.
+## Features
 
-## 🚀 Features
+- **HTTP/1.1 and HTTP/2.** HTTP/2 is negotiated via ALPN automatically. Multiple concurrent requests to the same host multiplex as streams over a single TCP connection.
+- **Strict, smuggling-resistant parser.** Rejects `Content-Length` + `Transfer-Encoding` conflicts and differing duplicate `Content-Length` headers.
+- **Connection pool with global and per-host caps**, FIFO waiter fairness, and connection recycling.
+- **Transparent decoding** of `gzip` and `deflate` out of the box; `br` and `zstd` when the optional libraries are installed.
+- **DNS cache with Happy Eyeballs v2** — IPv6/IPv4 races with a 250 ms stagger, bounded-TTL cache.
+- **Retry and circuit breaker** with error classification, decorrelated-jitter backoff, and `Retry-After` support. The first failure surfaces the original typed exception; `RetryError` only appears after at least one retry has run.
+- **Cookies, redirects, streaming bodies, JSON via `orjson` when available.**
 
-- **Ultra-Fast Performance**: Built from the ground up for speed with optimized protocol implementations
-- **Memory Efficient**: Advanced buffer pooling and zero-copy operations minimize memory consumption
-- **Connection Pooling**: Sophisticated connection management with protocol-aware optimizations
-- **HTTP/2 Support**: Native multiplexing with optimized stream handling
-- **Robust Error Handling**: Intelligent retry mechanisms with circuit breakers
-- **Async-First Design**: Built for asyncio with high concurrency
-- **Easy to Use**: Simple API that feels familiar to requests/httpx users
-
-## 📦 Installation
+## Installation
 
 ```bash
 pip install hyperhttp
+
+# Optional fast extras: uvloop, orjson, brotli, zstandard, h11
+pip install 'hyperhttp[speed]'
 ```
 
-For optional dependencies:
-
-```bash
-# For development
-pip install hyperhttp[dev]
-
-# For testing
-pip install hyperhttp[test]
-
-# For documentation
-pip install hyperhttp[doc]
-```
-
-## ⚡ Quick Start
+## Quick start
 
 ```python
 import asyncio
-from hyperhttp import Client
+import hyperhttp
 
 async def main():
-    client = Client()
-    
-    # Simple GET request
-    response = await client.get("https://example.com")
-    print(f"Status: {response.status_code}")
-    print(f"Body: {await response.text()}")
-    
-    # POST with JSON
-    response = await client.post(
-        "https://httpbin.org/post",
-        json={"key": "value"}
-    )
-    data = await response.json()
-    print(data)
-    
-    await client.close()
+    async with hyperhttp.Client() as client:
+        response = await client.get("https://example.com")
+        await response.aread()
+        print(response.status_code, response.text[:120])
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        response = await client.post(
+            "https://httpbin.org/post",
+            json={"key": "value"},
+        )
+        await response.aread()
+        print(response.json())
+
+asyncio.run(main())
 ```
 
-## 📊 Performance
-
-| Library   | Requests/sec | Peak Memory (MB) | P95 Latency (ms) | P99 Latency (ms) |
-|-----------|--------------|------------------|------------------|------------------|
-| hyperhttp | 24.78        | 1.78            | 835.02          | 1425.82         |
-| aiohttp   | 24.28        | 0.39            | 886.27          | 1451.86         |
-| httpx     | 21.52        | 1.01            | 1081.06         | 2028.91         |
-
-*Benchmark: 1,000 concurrent GET requests to httpbin.org/get*
-
-Key findings:
-- HyperHTTP achieves the highest throughput (24.78 req/sec)
-- Lowest P95 and P99 latencies among all tested libraries
-- Memory usage is optimized for high concurrency scenarios
-- Zero failed requests across all test runs
-
-## 📚 Documentation
-
-For detailed documentation, visit our [documentation site](https://hyperhttp.readthedocs.io/).
-
-## 🛠️ Advanced Usage
-
-### Parallel Requests
+### Streaming responses
 
 ```python
-async with Client() as client:
-    # Create tasks for parallel execution
-    tasks = [
-        client.get("https://httpbin.org/get"),
-        client.get("https://httpbin.org/ip"),
-        client.get("https://httpbin.org/headers")
-    ]
-    
-    # Execute all requests in parallel
-    responses = await asyncio.gather(*tasks)
+async with hyperhttp.Client() as client:
+    response = await client.get("https://example.com/large.bin")
+    async for chunk in response.aiter_bytes():
+        handle(chunk)
 ```
 
-### Custom Retry Policy
+### Parallel requests
+
+```python
+async with hyperhttp.Client() as client:
+    urls = [
+        "https://httpbin.org/get",
+        "https://httpbin.org/ip",
+        "https://httpbin.org/headers",
+    ]
+    responses = await asyncio.gather(*(client.get(u) for u in urls))
+    for r in responses:
+        await r.aread()
+```
+
+### Retry and circuit breaker
 
 ```python
 from hyperhttp import Client
@@ -120,41 +83,72 @@ from hyperhttp.utils.backoff import DecorrelatedJitterBackoff
 
 retry_policy = RetryPolicy(
     max_retries=5,
-    retry_categories=['TRANSIENT', 'TIMEOUT', 'SERVER'],
+    retry_categories=["TRANSIENT", "TIMEOUT", "SERVER"],
     status_force_list=[429, 500, 502, 503, 504],
-    backoff_strategy=DecorrelatedJitterBackoff(
-        base=0.1,
-        max_backoff=10.0,
-    ),
+    backoff_strategy=DecorrelatedJitterBackoff(base=0.1, max_backoff=10.0),
     respect_retry_after=True,
 )
 
-client = Client(retry_policy=retry_policy)
+async with Client(retry=retry_policy) as client:
+    response = await client.get("https://api.example.com/things")
 ```
 
-### Connection Pooling
+The first attempt is never wrapped in `RetryError` — callers always see the typed transport or timeout exception on the initial failure. `RetryError` is only raised once at least one retry has been attempted.
+
+### Connection pooling
 
 ```python
 client = Client(
-    max_connections=100,  # Total connections across all hosts
+    max_connections=200,           # global cap across all hosts
+    max_keepalive_connections=32,  # per host
+    http2=True,                    # negotiate HTTP/2 via ALPN
 )
 ```
 
-## 🤝 Contributing
+### HTTP/2
 
-We welcome contributions! Please see our [Contributing Guide](https://github.com/lmousom/hyperhttp/blob/main/CONTRIBUTING.md) for details.
+HTTP/2 is negotiated during the TLS handshake. When a host speaks h2, concurrent requests to that host share a single TCP connection and multiplex as streams, bounded by the server-advertised `MAX_CONCURRENT_STREAMS`. Pass `http2=False` to force HTTP/1.1.
 
-## 📄 License
+### uvloop
 
-This project is licensed under the MIT License - see the [LICENSE](https://github.com/lmousom/hyperhttp/blob/main/LICENSE) file for details.
+```python
+import hyperhttp
+hyperhttp.install_uvloop()  # no-op if uvloop isn't installed
+```
 
-## 🙏 Acknowledgments
+## Benchmarks
 
-- Inspired by the performance needs of modern web applications
-- Built with ❤️ by [Latiful Mousom](https://github.com/lmousom)
+Measured against `aiohttp` and `httpx` on a local `aiohttp` loopback server (no network, no DNS, no TLS), 2 000 requests per (client, body size), concurrency 64, Python 3.12, macOS arm64.
 
-## 📞 Support
+| Body size | Client    |     RPS | P50 (ms) | P95 (ms) | P99 (ms) |
+|----------:|-----------|--------:|---------:|---------:|---------:|
+|    200 B  | hyperhttp | 3 699   |    11.1  |    12.7  |    31.3  |
+|    200 B  | aiohttp   | 3 904   |    11.5  |    14.7  |    28.5  |
+|    200 B  | httpx     |   199   |   210.4  |   948.9  |  1452.9  |
+|   10 KiB  | hyperhttp | 3 527   |    11.8  |    13.7  |    32.2  |
+|   10 KiB  | aiohttp   | 3 794   |    11.9  |    15.1  |    29.1  |
+|   10 KiB  | httpx     |   203   |   204.8  |   902.1  |  1413.2  |
+|    1 MiB  | hyperhttp | 1 303   |    42.7  |    46.5  |    71.2  |
+|    1 MiB  | aiohttp   | 1 317   |    43.0  |    47.6  |    61.5  |
+|    1 MiB  | httpx     |    98   |   345.1  |  1465.9  |  2784.2  |
 
-- [GitHub Issues](https://github.com/lmousom/hyperhttp/issues)
-- [Documentation](https://hyperhttp.readthedocs.io/)
-- Email: latifulmousom@gmail.com
+HyperHTTP runs within ~5% of `aiohttp` across every body size and is 15–20× faster than `httpx` on this workload. Numbers come from loopback, so they reflect client-side CPU cost; real networks flatten the differences.
+
+Run it yourself:
+
+```bash
+pip install 'hyperhttp[bench]'
+python examples/benchmark_local.py
+```
+
+## Documentation
+
+Full documentation: [hyperhttp.readthedocs.io](https://hyperhttp.readthedocs.io/)
+
+## Contributing
+
+Issues and pull requests are welcome. See the [Contributing Guide](https://github.com/lmousom/hyperhttp/blob/main/docs/contributing.md).
+
+## License
+
+MIT — see [LICENSE](https://github.com/lmousom/hyperhttp/blob/main/LICENSE).

@@ -213,19 +213,18 @@ class DomainCircuitBreakerManager:
         breaker = await self.get_circuit_breaker(domain)
         return await breaker.execute(coro_func, *args, **kwargs)
             
-    def configure_domain(self, domain: str, **config: Any) -> None:
+    async def configure_domain(self, domain: str, **config: Any) -> None:
         """
         Configure a domain-specific circuit breaker.
-        
-        Args:
-            domain: Domain name
-            **config: Circuit breaker configuration
+
+        Acquires the manager's lock so we don't mutate the breaker map
+        concurrently with ``get_circuit_breaker``.
         """
         breaker_config = self._default_config.copy()
         breaker_config.update(config)
-        
-        circuit_breaker = CircuitBreaker(**breaker_config)
-        self._domain_breakers[domain] = circuit_breaker
+
+        async with self._lock:
+            self._domain_breakers[domain] = CircuitBreaker(**breaker_config)
     
     def get_stats(self) -> Dict[str, Dict[str, Any]]:
         """

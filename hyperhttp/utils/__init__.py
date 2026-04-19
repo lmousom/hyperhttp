@@ -12,7 +12,12 @@ from hyperhttp.utils.backoff import (
     DecorrelatedJitterBackoff,
     AdaptiveBackoff,
 )
-from hyperhttp.utils.dns_cache import DNSCache, DNSResolver
+from hyperhttp.utils.dns_cache import (
+    AddressInfo,
+    DNSCache,
+    DNSResolver,
+    happy_eyeballs_connect,
+)
 
 __all__ = [
     "BufferPool",
@@ -22,6 +27,8 @@ __all__ = [
     "ExponentialBackoff",
     "DecorrelatedJitterBackoff",
     "AdaptiveBackoff",
+    "AddressInfo",
     "DNSCache",
     "DNSResolver",
+    "happy_eyeballs_connect",
 ]
