@@ -1,64 +1,56 @@
 # Advanced Features
 
-This guide covers advanced features and configurations in HyperHTTP. Make sure you're familiar with the [basic usage](usage.md) before diving into these topics.
+Start with [Basic Usage](usage.md) before diving in here.
 
-## HTTP/2 Support
+## HTTP/2
 
-HyperHTTP provides native HTTP/2 support with multiplexing:
+HTTP/2 is negotiated via ALPN during the TLS handshake and is **on by default**.
 
 ```python
-from hyperhttp import Client
-
-# HTTP/2 is enabled by default
-client = Client()
-
-# Force HTTP/2 only
-client = Client(http2_only=True)
-
-# Disable HTTP/2
-client = Client(enable_http2=False)
+client = hyperhttp.Client(http2=True)   # default
+client = hyperhttp.Client(http2=False)  # force HTTP/1.1 only
 ```
 
-### Stream Multiplexing
-
-HTTP/2 allows multiple requests to share a single connection:
+When a host speaks h2, concurrent requests to that host share a single TCP
+connection and multiplex as independent streams (bounded by the server's
+`MAX_CONCURRENT_STREAMS`). The client transparently falls back to HTTP/1.1
+for hosts that don't advertise `h2` in ALPN.
 
 ```python
-async with Client() as client:
-    # These requests will be multiplexed over a single connection
+async with hyperhttp.Client() as client:
     responses = await asyncio.gather(
         client.get("https://example.com/api/1"),
         client.get("https://example.com/api/2"),
-        client.get("https://example.com/api/3")
+        client.get("https://example.com/api/3"),
     )
 ```
 
-## Connection Pooling
-
-### Pool Configuration
+## Connection pooling
 
 ```python
-client = Client(
-    max_connections=100,           # Total connections
-    max_keepalive_connections=20,  # Connections to keep alive
-    max_keepalive=300,        # Timeout in seconds
+client = hyperhttp.Client(
+    max_connections=200,           # global cap across all hosts
+    max_keepalive_connections=32,  # per-host keepalive cap
+    keepalive_expiry=120.0,        # seconds an idle connection is kept around
 )
 ```
 
-### Connection Reuse
+The pool enforces both the global and per-host cap with FIFO waiter fairness:
+the oldest request waiting for a connection is served first.
+
+You can inspect the pool at runtime:
 
 ```python
-async with Client() as client:
-    # These requests will reuse connections when possible
-    for i in range(10):
-        response = await client.get(f"https://api.example.com/item/{i}")
+stats = client.get_pool_stats()
+# {"example.com:443": {"idle": 4, "in_use": 2, "total": 6}, ...}
 ```
 
-## Advanced Retry Strategies
+## Retry policy
 
-### Custom Retry Policy
+Retries are opt-in. Pass a `RetryPolicy` to `Client(retry=...)`:
 
 ```python
+from hyperhttp import Client
 from hyperhttp.errors.retry import RetryPolicy
 from hyperhttp.utils.backoff import ExponentialBackoff
 
@@ -67,147 +59,127 @@ retry_policy = RetryPolicy(
     retry_categories=["TRANSIENT", "TIMEOUT", "SERVER"],
     status_force_list=[429, 500, 502, 503, 504],
     backoff_strategy=ExponentialBackoff(
-        initial=0.1,
-        multiplier=2.0,
-        max_backoff=30.0,
-        jitter=True
+        base=0.1,         # initial delay (seconds)
+        factor=2.0,       # multiplier per attempt
+        max_backoff=30.0, # cap on any single wait
+        jitter=True,
     ),
-    respect_retry_after=True
+    respect_retry_after=True,
 )
 
-client = Client(retry_policy=retry_policy)
+async with Client(retry=retry_policy) as client:
+    response = await client.get("https://api.example.com/things")
 ```
 
-### Custom Retry Conditions
+Decorrelated jitter usually behaves better than classic exponential backoff
+under load:
 
 ```python
-def should_retry(response):
-    # Custom logic to determine if retry is needed
-    return response.status_code == 418  # I'm a teapot
+from hyperhttp.utils.backoff import DecorrelatedJitterBackoff
 
 retry_policy = RetryPolicy(
-    max_retries=3,
-    retry_if_result=should_retry
+    max_retries=5,
+    backoff_strategy=DecorrelatedJitterBackoff(base=0.1, max_backoff=10.0),
 )
 ```
 
-## Memory Management
+The **first** failure always surfaces the original typed exception — e.g.
+`ReadTimeout`, `ConnectError`. `RetryError` is only raised once at least one
+retry has actually been attempted, with the underlying exception available on
+`.original_exception`.
 
-### Buffer Pooling
+Retries can also be disabled per request:
 
 ```python
-from hyperhttp.utils.memory import BufferPool
-
-client = Client(
-    buffer_pool=BufferPool(
-        initial_size=1024,    # Initial buffer size
-        max_size=1024*1024,   # Maximum buffer size
-        pool_size=100         # Number of buffers to keep
-    )
-)
+await client.post(url, json=payload, retry=False)
 ```
 
-### Zero-Copy Operations
+## Circuit breaker
+
+When a host keeps failing, the circuit breaker opens and fails fast instead of
+piling more timeouts on a sick server:
 
 ```python
-async with Client() as client:
-    response = await client.get("https://example.com/large-file")
-    
-    # Stream response without loading into memory
-    async with response.stream() as stream:
-        async for chunk in stream:
-            process_chunk(chunk)  # Process each chunk
-```
+from hyperhttp.errors.circuit_breaker import DomainCircuitBreakerManager
 
-## Circuit Breakers
-
-### Basic Circuit Breaker
-
-```python
-from hyperhttp.utils.circuit import CircuitBreaker
-
-circuit_breaker = CircuitBreaker(
-    failure_threshold=5,     # Number of failures before opening
-    recovery_timeout=30.0,   # Time to wait before half-open
-    success_threshold=2      # Successes needed to close
+cb = DomainCircuitBreakerManager(
+    failure_threshold=5,     # consecutive failures before opening
+    recovery_timeout=30.0,   # seconds before allowing a probe request
+    success_threshold=2,     # consecutive successes to fully close again
 )
 
-client = Client(circuit_breaker=circuit_breaker)
+async with Client(circuit_breaker_manager=cb) as client:
+    try:
+        response = await client.get("https://api.example.com/things")
+    except hyperhttp.CircuitBreakerOpen as e:
+        print(f"{e.host} unhealthy for another {e.remaining:.1f}s")
 ```
 
-### Per-Host Circuit Breakers
+Circuit breakers are tracked per host-port. Only the error categories listed in
+`DomainCircuitBreakerManager` (by default `CONNECTION`, `TIMEOUT`, `SERVER`,
+and `TRANSIENT`) count toward the failure threshold.
+
+## Telemetry
+
+Hook into every retry attempt for metrics/logging:
 
 ```python
-from hyperhttp.utils.circuit import HostCircuitBreaker
+from hyperhttp.errors.telemetry import ErrorTelemetry
 
-circuit_breaker = HostCircuitBreaker(
-    failure_threshold=5,
-    recovery_timeout=30.0,
-    success_threshold=2,
-    max_hosts=100  # Maximum number of hosts to track
-)
+class MyTelemetry(ErrorTelemetry):
+    def record_attempt(self, retry_state, outcome):
+        # outcome is "success" | "retry" | "fail"
+        ...
 
-client = Client(circuit_breaker=circuit_breaker)
+async with Client(telemetry=MyTelemetry()) as client:
+    ...
 ```
 
-## Custom Transport Layer
-
-### Custom SSL Configuration
+## TLS
 
 ```python
 import ssl
 
-ssl_context = ssl.create_default_context()
-ssl_context.load_cert_chain("client-cert.pem", "client-key.pem")
-ssl_context.load_verify_locations("ca-cert.pem")
+ctx = ssl.create_default_context()
+ctx.load_cert_chain("client-cert.pem", "client-key.pem")
 
-client = Client(ssl_context=ssl_context)
+client = hyperhttp.Client(ssl_context=ctx)
 ```
 
-### Custom DNS Resolution
+Quick toggles:
 
 ```python
-from hyperhttp.utils.dns import CustomResolver
+hyperhttp.Client(verify=False)                       # skip verification (dev only)
+hyperhttp.Client(verify="/path/to/ca-bundle.pem")    # custom CA bundle
+hyperhttp.Client(cert=("client.pem", "client.key"))  # mutual TLS
+```
 
-resolver = CustomResolver(
-    nameservers=["8.8.8.8", "8.8.4.4"],
-    cache_size=1000,
-    ttl=300
+## DNS and Happy Eyeballs
+
+DNS results are cached with bounded TTL, and dual-stack hosts race IPv6 vs.
+IPv4 with a configurable stagger:
+
+```python
+client = hyperhttp.Client(
+    happy_eyeballs_delay=0.25,  # seconds to wait before racing the other family
+    connect_timeout=10.0,
 )
-
-client = Client(resolver=resolver)
 ```
 
-## Monitoring and Metrics
+Set `happy_eyeballs_delay` to `0` to race both families immediately; set it
+high to effectively prefer IPv6.
 
-### Request Tracing
+## Custom user agent
 
 ```python
-from hyperhttp.utils.tracing import RequestTracer
-
-async def trace_callback(trace_data):
-    print(f"Request to {trace_data.url} took {trace_data.duration}s")
-
-tracer = RequestTracer(callback=trace_callback)
-client = Client(tracer=tracer)
+client = hyperhttp.Client(user_agent="my-service/1.2.3")
 ```
 
-### Performance Metrics
+Defaults to `hyperhttp/<version>`.
 
-```python
-from hyperhttp.utils.metrics import MetricsCollector
+## Next
 
-metrics = MetricsCollector()
-client = Client(metrics=metrics)
-
-# Later, get the metrics
-print(f"Average response time: {metrics.avg_response_time}ms")
-print(f"Success rate: {metrics.success_rate}%")
-print(f"Active connections: {metrics.active_connections}")
-```
-
-## Next Steps
-
-- Check out the [Performance Tips](performance.md) for optimizing your applications
-- Read the [API Reference](api/client.md) for detailed documentation
-- Learn about [Error Handling](api/errors.md) for robust applications 
+- [Performance Tips](performance.md)
+- [API Reference](api/client.md)
+- [Retry Policy](api/retry.md)
+- [Errors](api/errors.md)

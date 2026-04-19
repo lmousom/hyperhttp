@@ -1,193 +1,238 @@
 # Basic Usage
 
-This guide covers the common use cases and features of HyperHTTP. For more advanced scenarios, check out the [Advanced Features](advanced.md) guide.
+This guide covers the common API surface. See [Advanced Features](advanced.md)
+for retries, circuit breakers, and HTTP/2 tuning.
 
-## Making Requests
+## Making requests
 
-### GET Requests
+### GET
 
 ```python
-async with Client() as client:
-    # Simple GET
+async with hyperhttp.Client() as client:
     response = await client.get("https://api.example.com/users")
-    
-    # GET with query parameters
+
     response = await client.get(
         "https://api.example.com/search",
-        params={"q": "python", "sort": "stars"}
+        params={"q": "python", "sort": "stars"},
     )
-    
-    # GET with headers
+
     response = await client.get(
         "https://api.example.com/protected",
-        headers={"Authorization": "Bearer token123"}
+        headers={"Authorization": "Bearer token123"},
     )
 ```
 
-### POST Requests
+### POST / PUT / PATCH
 
 ```python
-async with Client() as client:
-    # POST with JSON data
+async with hyperhttp.Client() as client:
+    # JSON body (also sets Content-Type: application/json)
     response = await client.post(
         "https://api.example.com/users",
-        json={"name": "John", "email": "john@example.com"}
+        json={"name": "John", "email": "john@example.com"},
     )
-    
-    # POST with form data
+
+    # Form-encoded body (Content-Type: application/x-www-form-urlencoded)
+    response = await client.post(
+        "https://api.example.com/login",
+        data={"user": "alice", "password": "secret"},
+    )
+
+    # Raw bytes
+    response = await client.put(
+        "https://api.example.com/blob",
+        content=b"...binary...",
+    )
+
+    # Async generator for streaming uploads
+    async def chunks():
+        for i in range(100):
+            yield f"chunk-{i}\n".encode()
+
     response = await client.post(
         "https://api.example.com/upload",
-        data={"key": "value"},
-        files={"file": open("image.png", "rb")}
+        content=chunks(),
     )
 ```
 
-### Other HTTP Methods
+### Other methods
 
 ```python
-async with Client() as client:
-    # PUT request
-    response = await client.put(
-        "https://api.example.com/users/1",
-        json={"name": "Updated Name"}
-    )
-    
-    # PATCH request
-    response = await client.patch(
-        "https://api.example.com/users/1",
-        json={"email": "newemail@example.com"}
-    )
-    
-    # DELETE request
-    response = await client.delete("https://api.example.com/users/1")
+await client.head("https://api.example.com/users/1")
+await client.options("https://api.example.com/users")
+await client.delete("https://api.example.com/users/1")
 ```
 
-## Working with Responses
+Or call `client.request(method, url, ...)` for arbitrary methods.
 
-### Response Content
+## Working with responses
+
+The body is lazy. Call `await response.aread()` once to materialize it, or
+iterate the response for streaming access.
 
 ```python
-async with Client() as client:
+async with hyperhttp.Client() as client:
     response = await client.get("https://api.example.com/data")
-    
-    # Get JSON response
-    data = await response.json()
-    
-    # Get text response
-    text = await response.text()
-    
-    # Get raw bytes
-    bytes_data = await response.read()
+
+    await response.aread()
+    data_json  = response.json()      # sync after aread()
+    data_text  = response.text         # sync property after aread()
+    data_bytes = response.content      # sync property after aread()
 ```
 
-### Response Properties
+### Response attributes
 
 ```python
-# Status code and reason
-print(response.status_code)  # e.g., 200
-print(response.reason)       # e.g., "OK"
-
-# Headers
+print(response.status_code)    # 200
+print(response.http_version)   # "HTTP/1.1" or "HTTP/2"
+print(response.url)            # final URL (after redirects)
 print(response.headers["content-type"])
-
-# Cookies
-print(response.cookies["session"])
-
-# URL after redirects
-print(response.url)
+print(response.elapsed)        # seconds from request to response
+print(response.is_success)     # 2xx
+print(response.is_redirect)    # 30x
 ```
 
-## Session Management
-
-### Using Sessions
+### Raising on HTTP errors
 
 ```python
-async with Client() as client:
-    # Set default headers for all requests
-    client.headers.update({
-        "User-Agent": "HyperHTTP/1.0",
-        "Accept": "application/json"
-    })
-    
-    # Set default parameters
-    client.params.update({
-        "api_key": "your-api-key"
-    })
-    
-    # All requests will include the headers and parameters
-    response = await client.get("https://api.example.com/data")
+response = await client.get("https://api.example.com/missing")
+response.raise_for_status()  # raises HTTPStatusError for 4xx/5xx
 ```
 
-### Cookie Persistence
+### Streaming the body
 
 ```python
-async with Client() as client:
-    # Login request - sets cookies
-    await client.post(
-        "https://example.com/login",
-        data={"username": "user", "password": "pass"}
-    )
-    
-    # Subsequent requests use the same cookies
-    response = await client.get("https://example.com/protected")
+async with hyperhttp.Client() as client:
+    response = await client.get("https://example.com/large.bin")
+
+    async for chunk in response.aiter_bytes():
+        handle_bytes(chunk)
+
+    # Or: iterate text / lines
+    async for chunk in response.aiter_text():
+        ...
+
+    async for line in response.aiter_lines():
+        ...
 ```
 
-## Timeouts and Retries
+Iterating a response fully consumes it; the connection is returned to the
+pool automatically. If you break out early, use `await response.aclose()`
+to release the connection.
 
-### Setting Timeouts
+Responses also support `async with` for deterministic cleanup:
 
 ```python
-# Set timeout for a specific request
-response = await client.get(
-    "https://api.example.com/slow",
-    timeout=5.0  # 5 seconds
+async with await client.get("https://example.com/stream") as response:
+    async for chunk in response.aiter_bytes():
+        ...
+```
+
+## Client configuration
+
+```python
+client = hyperhttp.Client(
+    base_url="https://api.example.com",
+    headers={"User-Agent": "my-app/1.0"},
+    cookies={"session": "abc"},
+    timeout=30.0,
+    max_connections=100,
+    max_keepalive_connections=20,
+    keepalive_expiry=120.0,
+    http2=True,
+    follow_redirects=False,
+    max_redirects=20,
+    verify=True,
+)
+```
+
+Headers and cookies set on the client apply to every request; per-request
+`headers=` and `cookies=` merge on top.
+
+## Timeouts
+
+The simplest case is a single scalar:
+
+```python
+client = hyperhttp.Client(timeout=10.0)             # applied to all phases
+response = await client.get(url, timeout=5.0)       # per-request override
+```
+
+For fine-grained control over each phase, pass a `Timeout`:
+
+```python
+from hyperhttp import Timeout
+
+client = hyperhttp.Client(
+    timeout=Timeout(connect=5.0, read=30.0, write=30.0, pool=2.0),
+)
+```
+
+Set any phase to `None` to disable it.
+
+## Redirects
+
+Redirects are **off** by default so you can decide how to handle them.
+
+```python
+# Enable globally
+client = hyperhttp.Client(follow_redirects=True, max_redirects=10)
+
+# ...or per request
+response = await client.get(url, follow_redirects=True)
+```
+
+`response.url` always reflects the final URL after any redirects.
+
+## Cookies
+
+```python
+client = hyperhttp.Client(cookies={"session": "abc"})
+response = await client.post("https://example.com/login", data={...})
+# Set-Cookie values from the response are persisted on the client
+# and sent with subsequent requests to matching hosts.
+response = await client.get("https://example.com/profile")
+```
+
+## Error handling
+
+All exceptions inherit from `hyperhttp.HyperHTTPError`:
+
+```python
+import hyperhttp
+from hyperhttp import (
+    HyperHTTPError,
+    TransportError,
+    ConnectError,
+    TLSError,
+    ReadTimeout,
+    ConnectTimeout,
+    HTTPStatusError,
+    TooManyRedirects,
 )
 
-# Set default timeout for all requests
-client = Client(timeout=10.0)
-```
-
-### Automatic Retries
-
-```python
-from hyperhttp.errors.retry import RetryPolicy
-
-# Create a retry policy
-retry_policy = RetryPolicy(
-    max_retries=3,
-    retry_categories=["TRANSIENT", "TIMEOUT"]
-)
-
-# Use the retry policy
-client = Client(retry_policy=retry_policy)
-```
-
-## Error Handling
-
-```python
-from hyperhttp.errors import (
-    HTTPError,
-    ConnectionError,
-    TimeoutError,
-    RequestError
-)
-
-async with Client() as client:
+async with hyperhttp.Client() as client:
     try:
         response = await client.get("https://api.example.com/data")
         response.raise_for_status()
-    except HTTPError as e:
-        print(f"HTTP error occurred: {e}")
-    except ConnectionError as e:
-        print(f"Connection error: {e}")
-    except TimeoutError as e:
-        print(f"Request timed out: {e}")
-    except RequestError as e:
-        print(f"Request failed: {e}")
+    except HTTPStatusError as e:
+        print(f"HTTP {e.response.status_code} from {e.response.url}")
+    except ConnectTimeout:
+        print("Couldn't open a TCP connection in time")
+    except ReadTimeout:
+        print("Server didn't respond in time")
+    except TLSError as e:
+        print(f"TLS handshake failed: {e}")
+    except TransportError as e:
+        print(f"Transport-level failure: {e}")
+    except HyperHTTPError as e:
+        print(f"Something else went wrong: {e}")
 ```
 
-## Next Steps
+See the full hierarchy in [Errors API Reference](api/errors.md).
 
-- Learn about [Advanced Features](advanced.md) like connection pooling and HTTP/2
-- Check out [Performance Tips](performance.md) for optimizing your applications
-- Explore the [API Reference](api/client.md) for detailed documentation
+## Next
+
+- [Advanced Features](advanced.md) — retry, circuit breaker, HTTP/2, TLS
+- [Performance Tips](performance.md)
+- [API Reference](api/client.md)

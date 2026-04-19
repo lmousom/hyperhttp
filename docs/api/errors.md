@@ -1,219 +1,176 @@
 # Errors API Reference
 
-This page documents the error types and handling in HyperHTTP.
+All exceptions raised by HyperHTTP inherit from
+`hyperhttp.HyperHTTPError`. They're re-exported at the top level — import them
+straight from `hyperhttp`:
 
-## Exception Hierarchy
+```python
+from hyperhttp import (
+    HyperHTTPError,
+    TransportError,
+    ConnectError,
+    TLSError,
+    ProtocolError,
+    RemoteProtocolError,
+    ReadError,
+    WriteError,
+    DNSError,
+    TimeoutException,
+    ConnectTimeout,
+    ReadTimeout,
+    WriteTimeout,
+    PoolTimeout,
+    PoolClosed,
+    HTTPStatusError,
+    InvalidURL,
+    TooManyRedirects,
+    CircuitBreakerOpen,
+    StreamError,
+    StreamConsumed,
+    ResponseClosed,
+)
+```
+
+## Hierarchy
 
 ```
-RequestError
-├── HTTPError
-│   ├── ClientError
-│   └── ServerError
-├── ConnectionError
-│   ├── ConnectTimeout
-│   └── ReadTimeout
-├── TimeoutError
+HyperHTTPError
+├── TransportError
+│   ├── ConnectError          # TCP connect failed
+│   │   └── ConnectTimeout    # also TimeoutException
+│   ├── TLSError              # TLS handshake / cert validation
+│   ├── ProtocolError         # framing / parser violation
+│   │   ├── RemoteProtocolError
+│   │   └── LocalProtocolError
+│   ├── ReadError             # socket read failed / unexpected EOF
+│   │   └── ReadTimeout       # also TimeoutException
+│   ├── WriteError            # socket write failed
+│   │   └── WriteTimeout      # also TimeoutException
+│   └── DNSError              # name resolution failed
+├── TimeoutException
+│   ├── ConnectTimeout        # (also ConnectError)
+│   ├── ReadTimeout           # (also ReadError)
+│   ├── WriteTimeout          # (also WriteError)
+│   └── PoolTimeout           # waited too long for a pool slot
+├── HTTPStatusError           # raised by Response.raise_for_status()
+├── InvalidURL                # URL couldn't be parsed / is unsuitable
 ├── TooManyRedirects
-└── ValidationError
+├── PoolClosed                # request in flight when Client.aclose() ran
+├── CircuitBreakerOpen        # host is currently tripped
+└── StreamError
+    ├── StreamConsumed        # tried to re-read a consumed body
+    └── ResponseClosed        # operation on a closed response
 ```
 
-## Base Exceptions
+## Noteworthy exceptions
 
-### RequestError
+### `HTTPStatusError`
 
-```python
-class RequestError(Exception):
-    """Base exception for all HyperHTTP errors."""
-    
-    @property
-    def request(self) -> Request:
-        """The request that caused this error."""
-```
-
-### HTTPError
+Raised by `Response.raise_for_status()` for any `4xx` or `5xx` response. It
+carries the response object:
 
 ```python
-class HTTPError(RequestError):
-    """
-    Exception for HTTP error responses (4xx-5xx).
-    
-    Attributes:
-        status_code (int): HTTP status code
-        reason (str): Status reason phrase
-        response (Response): Full response object
-    """
-```
-
-## HTTP Status Errors
-
-### ClientError
-
-```python
-class ClientError(HTTPError):
-    """Exception for 4xx client errors."""
-```
-
-### ServerError
-
-```python
-class ServerError(HTTPError):
-    """Exception for 5xx server errors."""
-```
-
-## Network Errors
-
-### ConnectionError
-
-```python
-class ConnectionError(RequestError):
-    """Base class for connection-related errors."""
-```
-
-### ConnectTimeout
-
-```python
-class ConnectTimeout(ConnectionError):
-    """Exception for connection timeout."""
-```
-
-### ReadTimeout
-
-```python
-class ReadTimeout(ConnectionError):
-    """Exception for read timeout."""
-```
-
-## Other Errors
-
-### TimeoutError
-
-```python
-class TimeoutError(RequestError):
-    """Exception for request timeout."""
-```
-
-### TooManyRedirects
-
-```python
-class TooManyRedirects(RequestError):
-    """Exception when max redirects is exceeded."""
-```
-
-### ValidationError
-
-```python
-class ValidationError(RequestError):
-    """Exception for request validation errors."""
-```
-
-## Error Categories
-
-Errors are categorized for retry purposes:
-
-```python
-ERROR_CATEGORIES = {
-    "TRANSIENT": [
-        ConnectionError,
-        TimeoutError,
-        ServerError
-    ],
-    "TIMEOUT": [
-        ConnectTimeout,
-        ReadTimeout,
-        TimeoutError
-    ],
-    "SERVER": [
-        ServerError
-    ],
-    "RATE_LIMIT": [
-        TooManyRequests  # HTTP 429
-    ],
-    "CONNECTION": [
-        ConnectionError
-    ]
-}
-```
-
-## Error Handling Examples
-
-### Basic Error Handling
-
-```python
-from hyperhttp import Client
-from hyperhttp.errors import HTTPError, ConnectionError, TimeoutError
-
-async with Client() as client:
-    try:
-        response = await client.get("https://api.example.com/users")
-        response.raise_for_status()
-    except HTTPError as e:
-        print(f"HTTP {e.status_code}: {e.reason}")
-    except ConnectionError as e:
-        print(f"Connection failed: {e}")
-    except TimeoutError as e:
-        print(f"Request timed out: {e}")
-```
-
-### Handling Specific Status Codes
-
-```python
-from hyperhttp.errors import ClientError, ServerError
-
 try:
-    response = await client.get("https://api.example.com/users")
+    response = await client.get("https://api.example.com/missing")
     response.raise_for_status()
-except ClientError as e:
-    if e.status_code == 404:
-        print("Resource not found")
-    elif e.status_code == 401:
-        print("Authentication required")
-    elif e.status_code == 403:
-        print("Permission denied")
-except ServerError as e:
-    print(f"Server error: {e.status_code}")
+except hyperhttp.HTTPStatusError as e:
+    print(e.response.status_code)
+    print(e.response.headers)
+    await e.response.aread()
+    print(e.response.text)
 ```
 
-### Custom Error Handling
+### `CircuitBreakerOpen`
+
+Raised when a host has been marked unhealthy by the circuit breaker.
 
 ```python
-class CustomError(RequestError):
-    """Custom error type for specific handling."""
-
-def handle_response(response):
-    if response.status_code == 418:  # I'm a teapot
-        raise CustomError("This server is a teapot!")
-    response.raise_for_status()
-
-try:
-    response = await client.get("https://api.example.com/coffee")
-    handle_response(response)
-except CustomError as e:
-    print(f"Custom error: {e}")
+except hyperhttp.CircuitBreakerOpen as e:
+    print(e.host)        # e.g. "api.example.com:443"
+    print(e.remaining)   # seconds until the breaker enters HALF-OPEN
 ```
 
-### Retry Categories
+### `ConnectTimeout` vs. `ReadTimeout`
+
+These are distinct phases. `ConnectTimeout` means the TCP connect exceeded
+`connect_timeout`. `ReadTimeout` means the server accepted the connection but
+didn't produce a response within the `read` phase of the timeout.
 
 ```python
-from hyperhttp.errors.retry import RetryPolicy
-
-# Retry only timeout errors
-retry_policy = RetryPolicy(
-    max_retries=3,
-    retry_categories=["TIMEOUT"]
-)
-
-# Retry both timeouts and server errors
-retry_policy = RetryPolicy(
-    max_retries=3,
-    retry_categories=["TIMEOUT", "SERVER"]
+hyperhttp.Client(
+    timeout=hyperhttp.Timeout(connect=5.0, read=30.0, write=30.0, pool=2.0),
 )
 ```
 
-## Best Practices
+### `RetryError`
 
-1. **Always Check Status**: Use `response.raise_for_status()` to catch HTTP errors
-2. **Specific to General**: Handle specific exceptions before general ones
-3. **Categorize Errors**: Use error categories for retry policies
-4. **Custom Handling**: Create custom error types for specific needs
-5. **Log Details**: Include error details in logs for debugging
-6. **Graceful Degradation**: Provide fallback behavior for errors 
+Not re-exported at the top level — import from
+`hyperhttp.errors.retry` if you need to match on it:
+
+```python
+from hyperhttp.errors.retry import RetryError
+
+try:
+    await client.get("https://flaky.example.com/thing")
+except RetryError as e:
+    print(e.original_exception)
+    print(e.retry_state.attempt_count)
+```
+
+`RetryError` is only raised once at least one retry has been attempted. The
+**first** failure always surfaces the original typed exception.
+
+## Error classification
+
+Errors are mapped to categories for retry / circuit-breaker decisions. The
+defaults:
+
+| Category      | Exceptions                                                       |
+|---------------|------------------------------------------------------------------|
+| `CONNECTION`  | `ConnectError`, `DNSError`                                       |
+| `TIMEOUT`     | `ConnectTimeout`, `ReadTimeout`, `WriteTimeout`, `PoolTimeout`   |
+| `TRANSIENT`   | `ReadError`, `WriteError`, `ProtocolError`                       |
+| `SERVER`      | `HTTPStatusError` with 5xx status                                |
+| `RATE_LIMIT`  | `HTTPStatusError` with 429                                       |
+| `FATAL`       | `InvalidURL`, `TooManyRedirects`, 4xx status (other than 429)    |
+
+Pass `retry_categories=[...]` to `RetryPolicy` to change which ones are
+retried. See the [Retry Policy](retry.md) page.
+
+## Patterns
+
+### Catch the broad base class
+
+```python
+try:
+    response = await client.get(url)
+    response.raise_for_status()
+except hyperhttp.HyperHTTPError as e:
+    logger.warning("request failed: %s", e)
+```
+
+### Handle timeouts distinctly from other transport failures
+
+```python
+try:
+    response = await client.get(url)
+except hyperhttp.TimeoutException:
+    # connect/read/write/pool — any phase
+    ...
+except hyperhttp.TransportError:
+    # TCP, TLS, DNS, framing
+    ...
+```
+
+### Drain the response before re-raising
+
+If you `raise_for_status()` and want to log the body, read it first:
+
+```python
+response = await client.get(url)
+if not response.is_success:
+    await response.aread()
+    logger.error("upstream returned %s: %s",
+                 response.status_code, response.text[:500])
+    response.raise_for_status()
+```

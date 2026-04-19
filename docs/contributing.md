@@ -176,7 +176,6 @@ Fixes #123
 - Open an issue for bugs
 - Discuss major changes in issues
 - Join our community discussions
-- Read our [Code of Conduct](CODE_OF_CONDUCT.md)
 
 ## License
 

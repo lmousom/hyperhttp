@@ -1,58 +1,71 @@
-# Welcome to HyperHTTP
+# HyperHTTP
 
-HyperHTTP is a revolutionary HTTP client library for Python that achieves unprecedented performance while being written entirely in pure Python. Unlike other popular libraries that rely on C extensions or CPython bindings (like `requests` and `httpx`), HyperHTTP demonstrates that Python can be blazingly fast when designed with performance in mind.
+A fast, correct async HTTP client for Python. HTTP/1.1 and HTTP/2, built on
+`asyncio`.
 
-## Why HyperHTTP?
+HyperHTTP is designed for services that make a lot of outbound HTTP calls —
+API gateways, crawlers, load generators, backend-to-backend traffic — where
+throughput, tail latency, and memory behaviour under concurrency all matter.
 
-Through innovative architecture and optimization techniques, HyperHTTP delivers:
+## Features
 
-- **Pure Python Performance**: 15% faster than `aiohttp` and 20% faster than `httpx` in real-world benchmarks
-- **Memory Efficient**: 4.5x lower memory consumption than `httpx` and 4.4x lower than `aiohttp`
-- **Modern Design**: Native HTTP/2 support with optimized stream handling
-- **Zero Dependencies**: No external dependencies for core functionality
+- **HTTP/1.1 and HTTP/2.** HTTP/2 is negotiated via ALPN automatically.
+  Multiple concurrent requests to the same host multiplex as streams over a
+  single TCP connection.
+- **Strict, smuggling-resistant parser.** Rejects `Content-Length` +
+  `Transfer-Encoding` conflicts and differing duplicate `Content-Length`
+  headers.
+- **Connection pool** with global and per-host caps, FIFO waiter fairness, and
+  connection recycling.
+- **Transparent decoding** of `gzip` and `deflate` out of the box; `br` and
+  `zstd` when the optional libraries are installed.
+- **DNS cache with Happy Eyeballs v2** — IPv6/IPv4 races with a 250 ms
+  stagger, bounded-TTL cache.
+- **Retry and circuit breaker** with error classification, decorrelated-jitter
+  backoff, and `Retry-After` support.
+- **Cookies, redirects, streaming bodies, JSON via `orjson` when available.**
 
-## Key Features
-
-- **Ultra-Fast Performance**: Built from the ground up for speed with optimized protocol implementations
-- **Memory Efficient**: Advanced buffer pooling and zero-copy operations minimize memory consumption
-- **Connection Pooling**: Sophisticated connection management with protocol-aware optimizations
-- **HTTP/2 Support**: Native multiplexing with optimized stream handling
-- **Robust Error Handling**: Intelligent retry mechanisms with circuit breakers
-- **Async-First Design**: Built for asyncio with high concurrency
-- **Easy to Use**: Simple API that feels familiar to requests/httpx users
-
-## Quick Example
+## Quick example
 
 ```python
 import asyncio
-from hyperhttp import Client
+import hyperhttp
 
 async def main():
-    async with Client() as client:
-        # Simple GET request
+    async with hyperhttp.Client() as client:
         response = await client.get("https://example.com")
-        print(f"Status: {response.status_code}")
-        print(f"Body: {await response.text()}")
-        
-        # POST with JSON
-        response = await client.post(
-            "https://httpbin.org/post",
-            json={"key": "value"}
-        )
-        data = await response.json()
-        print(data)
+        await response.aread()
+        print(response.status_code, response.text[:120])
 
-if __name__ == "__main__":
-    asyncio.run(main())
+asyncio.run(main())
 ```
 
-## Performance Comparison
+## Benchmarks
 
-| Library   | Requests/sec | Peak Memory (MB) | P95 Latency (ms) | P99 Latency (ms) |
-|-----------|--------------|------------------|------------------|------------------|
-| hyperhttp | 24.78        | 1.78            | 835.02          | 1425.82         |
-| aiohttp   | 24.28        | 0.39            | 886.27          | 1451.86         |
-| httpx     | 21.52        | 1.01            | 1081.06         | 2028.91         |
+Measured against `aiohttp` and `httpx` on a local `aiohttp` loopback server
+(no network, no DNS, no TLS), 2 000 requests per (client, body size),
+concurrency 64.
 
-*Benchmark: 1,000 concurrent GET requests to httpbin.org/get*
+| Body size | Client    |     RPS | P50 (ms) | P95 (ms) | P99 (ms) |
+|----------:|-----------|--------:|---------:|---------:|---------:|
+|    200 B  | hyperhttp | 3 699   |    11.1  |    12.7  |    31.3  |
+|    200 B  | aiohttp   | 3 904   |    11.5  |    14.7  |    28.5  |
+|    200 B  | httpx     |   199   |   210.4  |   948.9  |  1452.9  |
+|   10 KiB  | hyperhttp | 3 527   |    11.8  |    13.7  |    32.2  |
+|   10 KiB  | aiohttp   | 3 794   |    11.9  |    15.1  |    29.1  |
+|   10 KiB  | httpx     |   203   |   204.8  |   902.1  |  1413.2  |
+|    1 MiB  | hyperhttp | 1 303   |    42.7  |    46.5  |    71.2  |
+|    1 MiB  | aiohttp   | 1 317   |    43.0  |    47.6  |    61.5  |
+|    1 MiB  | httpx     |    98   |   345.1  |  1465.9  |  2784.2  |
 
+HyperHTTP runs within ~5% of `aiohttp` across every body size and is 15–20×
+faster than `httpx` on this workload. See [Performance Tips](performance.md)
+for ways to squeeze more out of it.
+
+## Next steps
+
+- [Installation](installation.md)
+- [Quick Start](quickstart.md)
+- [Basic Usage](usage.md)
+- [Advanced Features](advanced.md)
+- [API Reference](api/client.md)

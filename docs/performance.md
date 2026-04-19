@@ -1,206 +1,147 @@
-# Performance Tips
+# Performance
 
-This guide provides best practices and tips for optimizing your application's performance with HyperHTTP.
+## Benchmarks
 
-## Connection Management
+Measured against `aiohttp` and `httpx` on a local `aiohttp` loopback server
+(no network, no DNS, no TLS), 2 000 requests per (client, body size),
+concurrency 64. Python 3.12, macOS arm64, uvloop enabled.
 
-### Connection Pooling
+| Body size | Client    |     RPS | P50 (ms) | P95 (ms) | P99 (ms) |
+|----------:|-----------|--------:|---------:|---------:|---------:|
+|    200 B  | hyperhttp | 3 699   |    11.1  |    12.7  |    31.3  |
+|    200 B  | aiohttp   | 3 904   |    11.5  |    14.7  |    28.5  |
+|    200 B  | httpx     |   199   |   210.4  |   948.9  |  1452.9  |
+|   10 KiB  | hyperhttp | 3 527   |    11.8  |    13.7  |    32.2  |
+|   10 KiB  | aiohttp   | 3 794   |    11.9  |    15.1  |    29.1  |
+|   10 KiB  | httpx     |   203   |   204.8  |   902.1  |  1413.2  |
+|    1 MiB  | hyperhttp | 1 303   |    42.7  |    46.5  |    71.2  |
+|    1 MiB  | aiohttp   | 1 317   |    43.0  |    47.6  |    61.5  |
+|    1 MiB  | httpx     |    98   |   345.1  |  1465.9  |  2784.2  |
 
-Use connection pooling to reuse connections and reduce overhead:
+HyperHTTP runs within ~5% of `aiohttp` across every body size and is 15–20×
+faster than `httpx` on this workload. Loopback numbers reflect client-side CPU
+cost; real networks flatten the differences.
+
+Run it yourself:
+
+```bash
+pip install 'hyperhttp[bench]'
+python examples/benchmark_local.py
+```
+
+## Tips for squeezing more out of it
+
+### 1. Install the speed extras
+
+```bash
+pip install 'hyperhttp[speed]'
+```
+
+This pulls in `uvloop`, `orjson`, `h11`, `brotli`, and `zstandard`. Each is
+auto-detected at import time.
+
+### 2. Turn on uvloop
 
 ```python
-client = Client(
-    max_connections=100,           # Adjust based on your needs
-    max_keepalive_connections=20,  # Keep connections alive
-    max_keepalive=300         # 5 minutes
+import hyperhttp
+hyperhttp.install_uvloop()  # call once at program start
+```
+
+This is a no-op if `uvloop` isn't installed (e.g. on Windows).
+
+### 3. Reuse a single `Client`
+
+The `Client` owns the connection pool, DNS cache, and retry handler.
+Creating one per request throws all of that away.
+
+```python
+# App startup
+client = hyperhttp.Client()
+
+# Per-request
+response = await client.get(url)
+
+# App shutdown
+await client.aclose()
+```
+
+### 4. Size the pool for your concurrency
+
+```python
+client = hyperhttp.Client(
+    max_connections=200,
+    max_keepalive_connections=32,
+    keepalive_expiry=120.0,
 )
 ```
 
-### HTTP/2 Multiplexing
+A good default: `max_connections >= peak_concurrency`,
+`max_keepalive_connections >= peak_concurrency_per_host`.
 
-Enable HTTP/2 for better performance with multiple requests:
+### 5. Let HTTP/2 do the multiplexing
 
-```python
-# HTTP/2 is enabled by default
-client = Client(http2_only=True)  # Force HTTP/2 for all requests
-```
+When a host supports HTTP/2 (most public APIs, CDNs, and load balancers do),
+every concurrent request reuses a single TCP connection instead of burning
+pool slots. Leave `http2=True` (the default).
 
-## Memory Optimization
-
-### Buffer Pooling
-
-Use buffer pooling to reduce memory allocations:
+### 6. Stream large bodies instead of `aread()`-ing them
 
 ```python
-from hyperhttp.utils.memory import BufferPool
-
-client = Client(
-    buffer_pool=BufferPool(
-        initial_size=8192,     # 8KB initial size
-        max_size=1024*1024,    # 1MB maximum
-        pool_size=100          # Pool size
-    )
-)
+async with await client.get(url) as response:
+    async for chunk in response.aiter_bytes():
+        process(chunk)
 ```
 
-### Streaming Responses
+`aread()` is optimised (zero-copy single-chunk fast path; `b"".join` for
+multi-chunk), but streaming avoids holding a full copy of the body in memory,
+which matters for large files and high concurrency.
 
-Stream large responses to avoid loading them entirely into memory:
+### 7. Run concurrently
 
 ```python
-async with Client() as client:
-    async with client.stream("https://example.com/large-file") as response:
-        async for chunk in response.iter_chunks(chunk_size=8192):
-            process_chunk(chunk)
+responses = await asyncio.gather(*(client.get(u) for u in urls))
 ```
 
-## Concurrent Requests
+With `asyncio.gather` (or a bounded-concurrency semaphore for larger batches),
+HyperHTTP will saturate the pool and multiplex HTTP/2 streams where possible.
 
-### Using asyncio.gather
-
-Make multiple requests concurrently:
-
-```python
-async def fetch_all(urls):
-    async with Client() as client:
-        tasks = [client.get(url) for url in urls]
-        responses = await asyncio.gather(*tasks)
-        return responses
-```
-
-### Batch Processing
-
-Process large numbers of requests in batches:
-
-```python
-async def process_in_batches(urls, batch_size=10):
-    async with Client() as client:
-        for i in range(0, len(urls), batch_size):
-            batch = urls[i:i + batch_size]
-            tasks = [client.get(url) for url in batch]
-            responses = await asyncio.gather(*tasks)
-            process_batch(responses)
-```
-
-## Request Optimization
-
-### Keep-Alive Headers
-
-Set appropriate keep-alive headers:
-
-```python
-headers = {
-    "Connection": "keep-alive",
-    "Keep-Alive": "timeout=300, max=1000"
-}
-
-client = Client(headers=headers)
-```
-
-### Compression
-
-Enable compression to reduce data transfer:
-
-```python
-headers = {
-    "Accept-Encoding": "gzip, deflate"
-}
-
-client = Client(headers=headers)
-```
-
-## Error Handling
-
-### Circuit Breakers
-
-Use circuit breakers to prevent cascading failures:
-
-```python
-from hyperhttp.utils.circuit import CircuitBreaker
-
-circuit_breaker = CircuitBreaker(
-    failure_threshold=5,
-    recovery_timeout=30.0
-)
-
-client = Client(circuit_breaker=circuit_breaker)
-```
-
-### Smart Retries
-
-Configure retries with exponential backoff:
+### 8. Use decorrelated-jitter backoff if you retry
 
 ```python
 from hyperhttp.errors.retry import RetryPolicy
-from hyperhttp.utils.backoff import ExponentialBackoff
+from hyperhttp.utils.backoff import DecorrelatedJitterBackoff
 
 retry_policy = RetryPolicy(
     max_retries=3,
-    backoff_strategy=ExponentialBackoff(
-        initial=0.1,
-        max_backoff=10.0
-    )
+    backoff_strategy=DecorrelatedJitterBackoff(base=0.1, max_backoff=10.0),
 )
-
-client = Client(retry_policy=retry_policy)
 ```
 
-## Monitoring
+This spreads retries across clients and avoids thundering-herd pile-ups.
 
-### Performance Metrics
-
-Monitor your application's performance:
+### 9. Put a circuit breaker in front of flaky dependencies
 
 ```python
-from hyperhttp.utils.metrics import MetricsCollector
+from hyperhttp.errors.circuit_breaker import DomainCircuitBreakerManager
 
-metrics = MetricsCollector()
-client = Client(metrics=metrics)
-
-# Periodically check metrics
-async def monitor_performance():
-    while True:
-        print(f"Success rate: {metrics.success_rate}%")
-        print(f"Average latency: {metrics.avg_response_time}ms")
-        await asyncio.sleep(60)
+client = hyperhttp.Client(
+    circuit_breaker_manager=DomainCircuitBreakerManager(
+        failure_threshold=5,
+        recovery_timeout=30.0,
+    ),
+)
 ```
 
-### Request Tracing
+When the breaker trips, calls fail fast with `CircuitBreakerOpen` instead of
+piling more work onto a sick server.
 
-Enable request tracing for debugging:
+## Checklist
 
-```python
-from hyperhttp.utils.tracing import RequestTracer
-
-async def trace_callback(trace_data):
-    if trace_data.duration > 1.0:  # Log slow requests
-        print(f"Slow request to {trace_data.url}: {trace_data.duration}s")
-
-client = Client(tracer=RequestTracer(callback=trace_callback))
-```
-
-## Best Practices
-
-1. **Connection Pooling**: Always use connection pooling for multiple requests to the same host.
-2. **HTTP/2**: Use HTTP/2 when possible for better multiplexing and performance.
-3. **Streaming**: Stream large responses instead of loading them into memory.
-4. **Concurrent Requests**: Use `asyncio.gather` for parallel requests.
-5. **Buffer Pooling**: Enable buffer pooling to reduce memory allocations.
-6. **Circuit Breakers**: Implement circuit breakers for external services.
-7. **Monitoring**: Use metrics and tracing to identify performance issues.
-8. **Compression**: Enable compression to reduce data transfer.
-9. **Batch Processing**: Process large numbers of requests in batches.
-10. **Error Handling**: Implement proper retry policies and error handling.
-
-## Performance Checklist
-
-- [ ] Connection pooling configured appropriately
-- [ ] HTTP/2 enabled where supported
-- [ ] Buffer pooling implemented
-- [ ] Streaming used for large responses
-- [ ] Concurrent requests optimized
-- [ ] Circuit breakers configured
-- [ ] Retry policies implemented
-- [ ] Compression enabled
-- [ ] Monitoring and metrics in place
-- [ ] Regular performance testing 
+- [ ] `pip install 'hyperhttp[speed]'`
+- [ ] `hyperhttp.install_uvloop()` at startup
+- [ ] One `Client` for the app lifetime
+- [ ] Pool sized for peak concurrency
+- [ ] `http2=True` (the default) for HTTP/2-capable hosts
+- [ ] `response.aiter_bytes()` for large downloads
+- [ ] `asyncio.gather` or a semaphore for parallelism
+- [ ] Retry + circuit breaker for any unreliable upstream
