@@ -15,6 +15,7 @@ from hyperhttp import (
     ReadError,
     WriteError,
     DNSError,
+    ProxyError,
     TimeoutException,
     ConnectTimeout,
     ReadTimeout,
@@ -46,7 +47,8 @@ HyperHTTPError
 │   │   └── ReadTimeout       # also TimeoutException
 │   ├── WriteError            # socket write failed
 │   │   └── WriteTimeout      # also TimeoutException
-│   └── DNSError              # name resolution failed
+│   ├── DNSError              # name resolution failed
+│   └── ProxyError            # HTTP proxy refused or misbehaved
 ├── TimeoutException
 │   ├── ConnectTimeout        # (also ConnectError)
 │   ├── ReadTimeout           # (also ReadError)
@@ -127,7 +129,7 @@ defaults:
 
 | Category      | Exceptions                                                       |
 |---------------|------------------------------------------------------------------|
-| `CONNECTION`  | `ConnectError`, `DNSError`                                       |
+| `CONNECTION`  | `ConnectError`, `DNSError`, `ProxyError`                         |
 | `TIMEOUT`     | `ConnectTimeout`, `ReadTimeout`, `WriteTimeout`, `PoolTimeout`   |
 | `TRANSIENT`   | `ReadError`, `WriteError`, `ProtocolError`                       |
 | `SERVER`      | `HTTPStatusError` with 5xx status                                |

@@ -31,6 +31,11 @@ class Client:
         telemetry: ErrorTelemetry | None = None,
         user_agent: str | None = None,
         accept_compressed: bool = True,
+        proxies: str | ProxyURL | Mapping[str, str | ProxyURL | None] | None = None,
+        trust_env: bool = True,
+        auth: Auth | tuple[str, str] | None = None,
+        event_hooks: Mapping[str, Iterable[Callable[..., Any]]] | None = None,
+        transport: Transport | None = None,
     ) -> None: ...
 ```
 
@@ -57,6 +62,11 @@ class Client:
 | `telemetry`                  | Hook called on every retry attempt.                                         |
 | `user_agent`                 | Overrides the default `hyperhttp/<version>` User-Agent.                     |
 | `accept_compressed`          | Advertise and transparently decode gzip/deflate (plus br/zstd if installed).|
+| `proxies`                    | Proxy URL (string) or per-scheme mapping (`http` / `https` / `all`). See [Proxies](../advanced.md#proxies). |
+| `trust_env`                  | When `True` (default), honour `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`. |
+| `auth`                       | Default auth for every request. `Auth` instance, `("user", "pass")` tuple (= `BasicAuth`), or `None`. See [Authentication](../advanced.md#authentication). |
+| `event_hooks`                | `{"request": [...], "response": [...]}` — sync or async callables invoked per network attempt. See [Event hooks](../advanced.md#event-hooks). |
+| `transport`                  | Custom transport instance. When set, bypasses the connection pool entirely (no DNS, no TLS, no sockets). Primary use case is `MockTransport` for tests — see the [Testing guide](../testing.md). |
 
 ### Methods
 
@@ -77,11 +87,13 @@ async def request(
     headers=None,
     cookies=None,
     content=None,       # bytes, bytearray, memoryview, or async iter[bytes]
-    data=None,          # form-encoded dict
+    data=None,          # form-encoded dict (or text fields when files= is set)
+    files=None,         # multipart file fields — see "File uploads" in advanced docs
     json=...,           # JSON-serialisable object
     timeout=...,        # per-request override
     follow_redirects=...,
     retry: bool = True, # set to False to bypass the client's retry policy
+    auth=...,           # per-request auth override; None disables the client default
 ) -> Response
 
 async def stream(method: str, url: str, **kwargs) -> Response
@@ -202,3 +214,22 @@ async with hyperhttp.Client() as client:
         async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
             sink.write(chunk)
 ```
+
+### Multipart upload
+
+```python
+import pathlib, hyperhttp
+
+async with hyperhttp.Client() as client:
+    response = await client.post(
+        "https://api.example.com/upload",
+        data={"user": "alice", "note": "report"},
+        files={
+            "avatar": ("me.png", b"\x89PNG...", "image/png"),
+            "report": pathlib.Path("./report.pdf"),
+        },
+    )
+```
+
+See [File uploads](../advanced.md#file-uploads) for supported part shapes,
+the `MultipartEncoder` / `MultipartFile` advanced API, and benchmarks.

@@ -27,24 +27,33 @@ from hyperhttp._compat import (
     install_uvloop,
 )
 from hyperhttp._headers import Headers
+from hyperhttp._multipart import MultipartEncoder, MultipartField, MultipartFile
+from hyperhttp._proxy import ProxyURL
 from hyperhttp._url import URL
+from hyperhttp.auth import Auth, BasicAuth, BearerAuth, DigestAuth
 from hyperhttp.client import Client, Request, Response, Timeout, __version__
+from hyperhttp.connection.tls import InsecureRequestWarning
 from hyperhttp.cookies import Cookies
+from hyperhttp.mock import MockResponse, MockTransport, Router
 from hyperhttp.exceptions import (
     CircuitBreakerOpen,
     ConnectError,
     ConnectTimeout,
+    DecompressionError,
     DNSError,
     HTTPStatusError,
     HyperHTTPError,
     InvalidURL,
+    LocalProtocolError,
     PoolClosed,
     PoolTimeout,
     ProtocolError,
+    ProxyError,
     ReadError,
     ReadTimeout,
     RemoteProtocolError,
     ResponseClosed,
+    ResponseTooLarge,
     StreamConsumed,
     StreamError,
     TimeoutException,
@@ -63,6 +72,17 @@ __all__ = [
     "Timeout",
     "Headers",
     "URL",
+    "ProxyURL",
+    "MultipartEncoder",
+    "MultipartField",
+    "MultipartFile",
+    "Auth",
+    "BasicAuth",
+    "BearerAuth",
+    "DigestAuth",
+    "MockResponse",
+    "MockTransport",
+    "Router",
     "Cookies",
     "install_uvloop",
     "HAS_ORJSON",
@@ -80,6 +100,7 @@ __all__ = [
     "ReadError",
     "WriteError",
     "DNSError",
+    "ProxyError",
     "TimeoutException",
     "ConnectTimeout",
     "ReadTimeout",
@@ -93,4 +114,8 @@ __all__ = [
     "StreamError",
     "StreamConsumed",
     "ResponseClosed",
+    "ResponseTooLarge",
+    "DecompressionError",
+    "LocalProtocolError",
+    "InsecureRequestWarning",
 ]

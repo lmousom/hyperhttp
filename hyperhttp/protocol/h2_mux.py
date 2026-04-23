@@ -46,6 +46,14 @@ logger = logging.getLogger("hyperhttp.protocol.h2")
 __all__ = ["H2Transport"]
 
 
+# Per-stream body buffer depth. Combined with HTTP/2's 65535-byte default
+# stream window, this caps the receive-side memory per stream at roughly
+# (maxsize × max_frame_size). The real bound comes from flow control which
+# we now release only *after* the consumer drains a chunk; this queue is
+# belt-and-suspenders against pathological small-frame flooding.
+_BODY_QUEUE_MAX = 32
+
+
 class _H2Stream:
     __slots__ = (
         "stream_id",
@@ -60,8 +68,13 @@ class _H2Stream:
         self.stream_id = stream_id
         self.head: Optional[ResponseHead] = None
         self.head_event = asyncio.Event()
-        # Body queue contains chunks; None signals end-of-stream.
-        self.body_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue()
+        # Bounded queue → the reader task naturally backpressures on a slow
+        # consumer by awaiting ``put`` here, which in turn means the HTTP/2
+        # flow-control window is no longer auto-advanced. A misbehaving server
+        # can't force us to buffer an unbounded amount of DATA frames.
+        self.body_queue: "asyncio.Queue[Optional[bytes]]" = asyncio.Queue(
+            maxsize=_BODY_QUEUE_MAX
+        )
         self.error: Optional[BaseException] = None
         self.ended = False
 
@@ -69,6 +82,12 @@ class _H2Stream:
         if self.error is None:
             self.error = exc
         self.head_event.set()
+        # Clear any pending chunks so the consumer wakes on None promptly.
+        while True:
+            try:
+                self.body_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         try:
             self.body_queue.put_nowait(None)
         except asyncio.QueueFull:  # pragma: no cover
@@ -309,6 +328,27 @@ class H2Transport(Transport):
                     raise stream.error
                 return
             yield chunk
+            # Consumer-driven flow control: only tell the peer that its bytes
+            # are "consumed" once we've actually handed them to the caller.
+            # This is the core defence against the unbounded-memory vector —
+            # a hostile server that ignores our flow-control window is
+            # dropped back to the advertised size (default 65535 / stream).
+            await self._ack_data(stream.stream_id, len(chunk))
+
+    async def _ack_data(self, stream_id: int, nbytes: int) -> None:
+        if nbytes <= 0 or self._closed:
+            return
+        try:
+            async with self._io_lock:
+                if self._closed:
+                    return
+                self._conn.acknowledge_received_data(nbytes, stream_id)
+                await self._flush_locked()
+        except Exception:
+            # The stream or connection may have been torn down between our
+            # decision to ack and our acquisition of the lock. That's fine —
+            # nothing useful to send.
+            pass
 
     async def _release_stream(self, stream_id: int) -> None:
         stream = self._streams.pop(stream_id, None)
@@ -351,12 +391,15 @@ class H2Transport(Transport):
                     raise ReadError(f"HTTP/2 read failed: {exc}") from exc
                 if not data:
                     raise RemoteProtocolError("HTTP/2 connection closed by peer")
+                # Decode frames under the io lock (h2 state mutation), then
+                # dispatch the resulting events *outside* the lock so dispatch
+                # can ``await`` on a full per-stream queue without starving
+                # the ack path (which also needs the lock).
                 async with self._io_lock:
                     events = self._conn.receive_data(data)
-                    # Handle events that require sending immediately.
-                    for event in events:
-                        self._dispatch_event(event)
                     await self._flush_locked()
+                for event in events:
+                    await self._dispatch_event(event)
         except asyncio.CancelledError:
             raise
         except BaseException as exc:  # noqa: BLE001
@@ -368,7 +411,7 @@ class H2Transport(Transport):
             self._closed = True
             self._notify_slot()
 
-    def _dispatch_event(self, event: h2.events.Event) -> None:
+    async def _dispatch_event(self, event: h2.events.Event) -> None:
         if isinstance(event, h2.events.ResponseReceived):
             stream = self._streams.get(event.stream_id)
             if stream is None:
@@ -396,26 +439,24 @@ class H2Transport(Transport):
         elif isinstance(event, h2.events.DataReceived):
             stream = self._streams.get(event.stream_id)
             if stream is None:
+                # Stream was cancelled locally before the DATA arrived; ack
+                # the bytes so the connection-level window doesn't leak.
+                await self._ack_data(
+                    event.stream_id, event.flow_controlled_length
+                )
                 return
-            # Acknowledge data for flow control; do this unconditionally so
-            # the window recovers even if the caller is slow.
-            self._conn.acknowledge_received_data(
-                event.flow_controlled_length, event.stream_id
-            )
-            try:
-                stream.body_queue.put_nowait(bytes(event.data))
-            except asyncio.QueueFull:  # pragma: no cover
-                pass
+            # Do NOT ack here — flow control is consumer-driven. See
+            # ``_body_iter`` and ``_ack_data``. Putting into a bounded queue
+            # back-pressures the whole reader loop on a slow stream, which
+            # in turn keeps HTTP/2's own flow-control window shut.
+            await stream.body_queue.put(bytes(event.data))
 
         elif isinstance(event, h2.events.StreamEnded):
             stream = self._streams.get(event.stream_id)
             if stream is None:
                 return
             stream.ended = True
-            try:
-                stream.body_queue.put_nowait(None)
-            except asyncio.QueueFull:  # pragma: no cover
-                pass
+            await stream.body_queue.put(None)
 
         elif isinstance(event, h2.events.StreamReset):
             stream = self._streams.get(event.stream_id)

@@ -76,11 +76,13 @@ nav:
   - User Guide:
     - Basic Usage: usage.md
     - Advanced Features: advanced.md
+    - Testing: testing.md
     - Performance Tips: performance.md
   - API Reference:
     - Client: api/client.md
     - Retry Policy: api/retry.md
     - Errors: api/errors.md
+    - Mock Transport: api/mock.md
   - Development:
     - Contributing: contributing.md
     - Changelog: changelog.md

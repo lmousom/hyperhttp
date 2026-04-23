@@ -17,12 +17,15 @@ materialization helpers on top of that stream.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from types import TracebackType
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -36,9 +39,12 @@ from typing import (
 from hyperhttp._compat import accept_encoding, json_dumps, json_loads
 from hyperhttp._compression import IdentityDecoder, make_decoder
 from hyperhttp._headers import Headers, HeadersInput
+from hyperhttp._multipart import MultipartEncoder
+from hyperhttp._proxy import ProxiesInput, ProxyConfig
 from hyperhttp._url import URL, QueryInput, encode_query
+from hyperhttp.auth import Auth, _coerce_auth
 from hyperhttp.connection.pool import ConnectionPoolManager, PoolOptions
-from hyperhttp.connection.transport import RawResponse, Transport
+from hyperhttp.connection.transport import RawResponse, Transport  # noqa: F401
 from hyperhttp.cookies import Cookies, CookiesInput
 from hyperhttp.errors.circuit_breaker import DomainCircuitBreakerManager
 from hyperhttp.errors.retry import RetryHandler, RetryPolicy
@@ -49,13 +55,14 @@ from hyperhttp.exceptions import (
     InvalidURL,
     ReadTimeout,
     RemoteProtocolError,
+    ResponseTooLarge,
     StreamConsumed,
     TooManyRedirects,
 )
 from hyperhttp.utils.buffer_pool import BufferPool
 from hyperhttp.utils.dns_cache import DNSResolver
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 logger = logging.getLogger("hyperhttp.client")
 
@@ -123,6 +130,8 @@ class Response:
         "_content",
         "_default_encoding",
         "_on_close",
+        "_max_response_size",
+        "_raw_bytes_seen",
     )
 
     def __init__(
@@ -134,6 +143,8 @@ class Response:
         elapsed: float,
         default_encoding: str = "utf-8",
         on_close: Any = None,
+        max_response_size: Optional[int] = None,
+        max_decompressed_size: Optional[int] = None,
     ) -> None:
         self.status_code = raw.status_code
         self.http_version = raw.http_version
@@ -143,13 +154,18 @@ class Response:
         self.elapsed = elapsed
         self._raw = raw
         ce = raw.headers.get("content-encoding")
-        self._decoder = make_decoder(ce)
+        # The decoder's cap covers both identity-encoded bodies (effectively
+        # a raw-size cap) and compressed bodies (a zip-bomb cap). We always
+        # feed bytes through the decoder, so this is the single chokepoint.
+        self._decoder = make_decoder(ce, max_output_size=max_decompressed_size)
         self._iter = raw.aiter_raw()
         self._consumed = False
         self._closed = False
         self._content: Optional[bytes] = None
         self._default_encoding = default_encoding
         self._on_close = on_close
+        self._max_response_size = max_response_size
+        self._raw_bytes_seen = 0
 
     # -- context manager ---------------------------------------------------
 
@@ -181,6 +197,24 @@ class Response:
 
     # -- streaming accessors -----------------------------------------------
 
+    def _track_raw(self, size: int) -> None:
+        """Accounting helper: enforce the raw-bytes-seen cap.
+
+        ``max_response_size`` is the cap on *encoded* bytes off the wire —
+        a gzip bomb is caught by the decoder's cap (:class:`Decoder`), this
+        one catches attackers that don't bother compressing at all and just
+        stream an endless identity body. Crossing it short-circuits the
+        read so we never allocate the next chunk.
+        """
+        if self._max_response_size is None:
+            return
+        self._raw_bytes_seen += size
+        if self._raw_bytes_seen > self._max_response_size:
+            raise ResponseTooLarge(
+                "Response body exceeded max_response_size "
+                f"({self._max_response_size} bytes)"
+            )
+
     async def aiter_raw(self) -> AsyncIterator[bytes]:
         """Yield raw (still-encoded) body chunks. Rare — most callers want ``aiter_bytes``."""
         if self._consumed:
@@ -189,6 +223,7 @@ class Response:
         try:
             async for chunk in self._iter:
                 if chunk:
+                    self._track_raw(len(chunk))
                     yield chunk
         finally:
             await self.aclose()
@@ -205,6 +240,7 @@ class Response:
             async for raw in self._iter:
                 if not raw:
                     continue
+                self._track_raw(len(raw))
                 decoded = self._decoder.decompress(raw)
                 if not decoded:
                     continue
@@ -276,6 +312,19 @@ class Response:
             except ValueError:
                 total = -1
             if total >= 0:
+                # Enforce the raw-size cap before we even touch the wire:
+                # a server that advertises Content-Length larger than our
+                # cap is free to lie, but we won't allocate that memory.
+                if (
+                    self._max_response_size is not None
+                    and total > self._max_response_size
+                ):
+                    await self.aclose()
+                    raise ResponseTooLarge(
+                        "Response Content-Length "
+                        f"({total}) exceeds max_response_size "
+                        f"({self._max_response_size} bytes)"
+                    )
                 self._consumed = True
                 try:
                     if total == 0:
@@ -293,6 +342,7 @@ class Response:
                             raise RemoteProtocolError(
                                 f"Server sent more bytes than Content-Length ({total})"
                             )
+                        self._track_raw(clen)
                         # Zero-copy single-chunk fast path: the whole body
                         # arrived in one piece — hand it straight back.
                         if first is None:
@@ -408,12 +458,39 @@ class Client:
         telemetry: Optional[ErrorTelemetry] = None,
         user_agent: Optional[str] = None,
         accept_compressed: bool = True,
+        proxies: "ProxiesInput" = None,
+        trust_env: bool = True,
+        auth: Any = None,
+        event_hooks: Optional[Mapping[str, Iterable[Callable[..., Any]]]] = None,
+        transport: Any = None,
+        max_response_size: Optional[int] = None,
+        max_decompressed_size: Optional[int] = 64 * 1024 * 1024,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._default_timeout = _normalize_timeout(timeout)
         self._follow_redirects = follow_redirects
         self._max_redirects = max_redirects
         self._closed = False
+
+        # Surface a warning immediately when TLS verification is disabled so
+        # the choice is visible to whoever configures the Client, not only
+        # on the first HTTPS handshake (which may be much later).
+        if verify is False and ssl_context is None:
+            from hyperhttp.connection.tls import _warn_insecure_verify
+
+            _warn_insecure_verify()
+        # Resource limits applied to every response the client produces.
+        # ``max_response_size`` caps raw bytes off the wire (catches attackers
+        # that skip compression and stream forever). ``max_decompressed_size``
+        # caps the output of any Content-Encoding decoder so a zip bomb can't
+        # OOM the process — defaults to 64 MiB, override per-client for
+        # bulk-download workloads or set to ``None`` to disable.
+        if max_response_size is not None and max_response_size <= 0:
+            raise ValueError("max_response_size must be positive or None")
+        if max_decompressed_size is not None and max_decompressed_size <= 0:
+            raise ValueError("max_decompressed_size must be positive or None")
+        self._max_response_size = max_response_size
+        self._max_decompressed_size = max_decompressed_size
 
         # Default request headers.
         self._headers = Headers()
@@ -428,6 +505,28 @@ class Client:
 
         self._buffer_pool = BufferPool()
         self._dns = DNSResolver()
+        self._proxy_config = ProxyConfig(proxies, trust_env=trust_env)
+        self._auth: Optional[Auth] = _coerce_auth(auth)
+        # When ``transport`` is provided (typically a MockTransport or any
+        # custom Transport implementation) the Client bypasses the
+        # connection pool entirely and sends every request through it.
+        # DNS, TLS and socket setup are skipped — perfect for tests and for
+        # routing over exotic transports (e.g. in-process).
+        self._transport: Optional[Transport] = transport
+        # Public-facing so callers can append at runtime, matching the
+        # ergonomics of ``httpx``. Unknown events raise on lookup, not here.
+        self.event_hooks: Dict[str, List[Callable[..., Any]]] = {
+            "request": [],
+            "response": [],
+        }
+        if event_hooks:
+            for event, hooks in event_hooks.items():
+                if event not in self.event_hooks:
+                    raise ValueError(
+                        f"Unknown event hook: {event!r} "
+                        f"(supported: {sorted(self.event_hooks)})"
+                    )
+                self.event_hooks[event] = list(hooks)
         self._pool = ConnectionPoolManager(
             options=PoolOptions(
                 max_connections=max_connections,
@@ -439,6 +538,7 @@ class Client:
                 ssl_context=ssl_context,
                 connect_timeout=connect_timeout,
                 happy_eyeballs_delay=happy_eyeballs_delay,
+                proxy_config=self._proxy_config,
             ),
             dns=self._dns,
             buffer_pool=self._buffer_pool,
@@ -473,6 +573,8 @@ class Client:
         if self._closed:
             return
         self._closed = True
+        if self._transport is not None:
+            await self._transport.aclose()
         await self._pool.aclose()
 
     @property
@@ -518,25 +620,39 @@ class Client:
         cookies: CookiesInput = None,
         content: Any = None,
         data: Any = None,
+        files: Any = None,
         json: Any = _UNSET,
         timeout: Any = _UNSET,
         follow_redirects: Any = _UNSET,
         retry: bool = True,
+        auth: Any = _UNSET,
     ) -> Response:
         """Issue a single HTTP request and return the response.
 
         ``content`` may be ``bytes``, ``bytearray``, ``memoryview``, or an
         async iterable of bytes (for chunked uploads). ``json`` and ``data``
         are convenience encoders.
+
+        ``files`` triggers ``multipart/form-data`` encoding. It accepts a
+        dict or an iterable of ``(name, value)`` pairs; each ``value`` may
+        be ``bytes``, a ``str``, a ``pathlib.Path``, an open binary file,
+        a ``(filename, content[, content_type])`` tuple, or a
+        :class:`hyperhttp.MultipartFile`. When ``files`` is provided,
+        ``data`` is treated as the set of text fields to include in the
+        same multipart body.
         """
         if self._closed:
             raise HyperHTTPError("Client has been closed")
 
         full_url = self._build_url(url, params)
         merged_headers = self._merge_headers(headers)
-        body, content_type = self._encode_body(content, data, json)
+        body, content_type, content_length = self._encode_body(
+            content, data, json, files
+        )
         if content_type and "content-type" not in merged_headers:
             merged_headers.set("Content-Type", content_type)
+        if content_length is not None and "content-length" not in merged_headers:
+            merged_headers.set("Content-Length", str(content_length))
 
         request = Request(method, full_url, merged_headers, body)
         # Request-scoped cookies + jar.
@@ -549,23 +665,103 @@ class Client:
             self._follow_redirects if follow_redirects is _UNSET else bool(follow_redirects)
         )
 
-        if retry and self._retry_handler is not None:
-            async def executor(*, method: str, url: str, **_: Any) -> Response:
-                return await self._send_single(request, timeout_obj)
-
-            response = await self._retry_handler.execute(
-                executor,
-                method=request.method,
-                url=str(request.url),
-                domain=full_url.host_port,
-            )
+        # Per-request ``auth=`` explicitly overrides the client default.
+        # ``auth=None`` *disables* the default; ``auth=_UNSET`` inherits it.
+        effective_auth: Optional[Auth]
+        if auth is _UNSET:
+            effective_auth = self._auth
         else:
-            response = await self._send_single(request, timeout_obj)
+            effective_auth = _coerce_auth(auth)
+
+        response = await self._send_with_auth(
+            request, timeout_obj, effective_auth, retry=retry
+        )
 
         if do_redirects and response.is_redirect:
             response = await self._handle_redirects(response, request, timeout_obj)
 
         return response
+
+    async def _dispatch(
+        self,
+        request: Request,
+        timeout_obj: "Timeout",
+        *,
+        retry: bool,
+    ) -> Response:
+        """Send a single Request with retry + circuit breaker wrapping.
+
+        Event hooks fire inside each retry attempt: ``request`` hooks run
+        immediately before the network write (so retries and auth rounds
+        re-sign with the current clock), and ``response`` hooks run right
+        after the response head is parsed.
+        """
+        if retry and self._retry_handler is not None:
+            async def executor(*, method: str, url: str, **_: Any) -> Response:
+                await self._fire_hooks("request", request)
+                response = await self._send_single(request, timeout_obj)
+                await self._fire_hooks("response", response)
+                return response
+
+            return await self._retry_handler.execute(
+                executor,
+                method=request.method,
+                url=str(request.url),
+                domain=request.url.host_port,
+            )
+        await self._fire_hooks("request", request)
+        response = await self._send_single(request, timeout_obj)
+        await self._fire_hooks("response", response)
+        return response
+
+    async def _fire_hooks(self, event: str, payload: Any) -> None:
+        hooks = self.event_hooks.get(event)
+        if not hooks:
+            return
+        for hook in hooks:
+            result = hook(payload)
+            if inspect.isawaitable(result):
+                await result
+
+    async def _send_with_auth(
+        self,
+        request: Request,
+        timeout_obj: "Timeout",
+        auth: Optional[Auth],
+        *,
+        retry: bool,
+    ) -> Response:
+        """Run ``auth.auth_flow`` over repeated dispatches.
+
+        Each yielded request goes through the full retry + circuit-breaker
+        wrapping. Intermediate responses (e.g. the 401 that triggers a
+        Digest round-trip) are drained so their connection returns to the
+        pool cleanly before the next attempt.
+        """
+        if auth is None:
+            return await self._dispatch(request, timeout_obj, retry=retry)
+
+        flow = auth.auth_flow(request)
+        try:
+            next_request = next(flow)
+        except StopIteration:
+            return await self._dispatch(request, timeout_obj, retry=retry)
+
+        response: Optional[Response] = None
+        while True:
+            response = await self._dispatch(next_request, timeout_obj, retry=retry)
+            try:
+                next_request = flow.send(response)
+            except StopIteration:
+                return response
+            # We'll replace ``response`` — drain the old one so the connection
+            # can be reused. Swallow errors so auth isn't masked by a
+            # transport hiccup during drain.
+            try:
+                await response.aread()
+            except Exception:
+                pass
+            await response.aclose()
 
     async def stream(
         self,
@@ -602,26 +798,101 @@ class Client:
         content: Any,
         data: Any,
         json: Any,
-    ) -> Tuple[Any, Optional[str]]:
+        files: Any = None,
+    ) -> Tuple[Any, Optional[str], Optional[int]]:
+        # Multipart: when ``files`` is set (or the caller hands us a
+        # pre-built encoder) we return a streaming body with a known
+        # Content-Length whenever possible.
+        if files is not None or isinstance(content, MultipartEncoder) or isinstance(data, MultipartEncoder):
+            encoder = self._build_multipart(content, data, files)
+            return encoder, encoder.content_type, encoder.content_length
         if json is not _UNSET:
-            return json_dumps(json), "application/json"
+            payload = json_dumps(json)
+            return payload, "application/json", len(payload)
         if data is not None:
             if isinstance(data, Mapping) or (
                 isinstance(data, Iterable) and not isinstance(data, (str, bytes, bytearray))
             ):
                 encoded = encode_query(data).encode("ascii")
-                return encoded, "application/x-www-form-urlencoded"
+                return encoded, "application/x-www-form-urlencoded", len(encoded)
             if isinstance(data, str):
-                return data.encode("utf-8"), "text/plain; charset=utf-8"
-            return data, None
+                encoded = data.encode("utf-8")
+                return encoded, "text/plain; charset=utf-8", len(encoded)
+            return data, None, len(data) if isinstance(data, (bytes, bytearray, memoryview)) else None
         if content is None:
-            return None, None
+            return None, None, None
         if isinstance(content, str):
-            return content.encode("utf-8"), "text/plain; charset=utf-8"
-        return content, None
+            encoded = content.encode("utf-8")
+            return encoded, "text/plain; charset=utf-8", len(encoded)
+        if isinstance(content, (bytes, bytearray, memoryview)):
+            return content, None, len(content)
+        return content, None, None
+
+    @staticmethod
+    def _build_multipart(content: Any, data: Any, files: Any) -> MultipartEncoder:
+        # Pre-built encoder via ``content=`` or ``data=``.
+        if isinstance(content, MultipartEncoder):
+            return content
+        if isinstance(data, MultipartEncoder):
+            return data
+
+        fields: list = []
+        # Text fields from ``data``: accept a mapping or iterable of pairs.
+        if data is not None:
+            if isinstance(data, Mapping):
+                fields.extend(data.items())
+            elif isinstance(data, Iterable) and not isinstance(data, (str, bytes, bytearray)):
+                fields.extend(data)
+            else:
+                raise TypeError(
+                    "When used with files=, data must be a dict or iterable of pairs"
+                )
+
+        if files is None:
+            return MultipartEncoder(fields)
+
+        if isinstance(files, Mapping):
+            raw_files = list(files.items())
+        elif isinstance(files, Iterable):
+            raw_files = list(files)
+        else:
+            raise TypeError("files must be a dict or iterable of (name, value) pairs")
+
+        # In the ``files=`` context a bare ``str`` is conventionally a filesystem
+        # path, not a text field. Wrap it as ``pathlib.Path`` so the encoder
+        # picks the streaming-from-disk source.
+        import pathlib
+
+        for name, value in raw_files:
+            if isinstance(value, str) and not isinstance(value, (bytes, bytearray)):
+                value = pathlib.Path(value)
+            fields.append((name, value))
+
+        return MultipartEncoder(fields)
 
     async def _send_single(self, request: Request, timeout: "Timeout") -> Response:
         start = time.monotonic()
+
+        # Injected transport (e.g. MockTransport) — no pool, no DNS, no TLS.
+        if self._transport is not None:
+            raw = await self._transport.handle_request(
+                method=request.method,
+                url=request.url,
+                headers=request.headers,
+                body=request.content,
+                timeout=timeout.read,
+            )
+            response = Response(
+                raw=raw,
+                request=request,
+                url=request.url,
+                elapsed=time.monotonic() - start,
+                max_response_size=self._max_response_size,
+                max_decompressed_size=self._max_decompressed_size,
+            )
+            self._cookies.extract_from_response(request.url, response.headers)
+            return response
+
         transport = await self._pool.acquire(request.url, timeout=timeout.pool)
 
         # On any failure, make sure we release/discard the transport.
@@ -651,6 +922,8 @@ class Client:
             url=request.url,
             elapsed=elapsed,
             on_close=_release_pool_slot,
+            max_response_size=self._max_response_size,
+            max_decompressed_size=self._max_decompressed_size,
         )
         # Extract response cookies as soon as the head is in.
         self._cookies.extract_from_response(request.url, response.headers)
@@ -679,7 +952,6 @@ class Client:
             )
 
             history.append(current)
-            # Drain the previous response so its connection is released.
             try:
                 await current.aclose()
             except Exception:
@@ -689,6 +961,15 @@ class Client:
             # Drop content-headers if body is being dropped.
             if new_body is None:
                 for h in ("content-length", "content-type", "transfer-encoding"):
+                    if h in new_headers:
+                        del new_headers[h]
+
+            # Cross-origin / scheme-downgrade safety: never forward credentials
+            # attached to the original request to a different origin, and never
+            # downgrade credentials from https:// to http://. The cookie jar is
+            # re-consulted below and applies its own Domain/Path/Secure rules.
+            if _is_credential_leak_redirect(request.url, new_url):
+                for h in ("authorization", "proxy-authorization", "cookie"):
                     if h in new_headers:
                         del new_headers[h]
 
@@ -715,6 +996,29 @@ class Client:
         if status in (301, 302) and method not in ("GET", "HEAD"):
             return "GET", None
         return method, body
+
+
+# ---------------------------------------------------------------------------
+# Redirect credential-leak safety
+# ---------------------------------------------------------------------------
+
+
+def _is_credential_leak_redirect(origin: URL, target: URL) -> bool:
+    """Return ``True`` when forwarding auth from ``origin`` to ``target`` is unsafe.
+
+    Two conditions trigger stripping: a cross-origin redirect (any of scheme,
+    host, or port differs) and an https→http scheme downgrade (always unsafe,
+    even if the hostname is unchanged — credentials would travel in clear).
+    """
+    if origin.scheme == "https" and target.scheme == "http":
+        return True
+    if origin.scheme != target.scheme:
+        return True
+    if origin.host.lower() != target.host.lower():
+        return True
+    if origin.port != target.port:
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------

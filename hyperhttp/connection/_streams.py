@@ -30,7 +30,7 @@ from typing import Any, Deque, Optional, Tuple
 
 from hyperhttp.exceptions import ConnectError, ConnectTimeout, TLSError
 
-__all__ = ["FastStream", "open_fast_stream"]
+__all__ = ["FastStream", "open_fast_stream", "upgrade_to_tls"]
 
 
 # High/low watermarks for pause_reading. 2 MiB is large enough that a
@@ -328,4 +328,60 @@ async def open_fast_stream(
         except OSError:
             pass
 
+    return stream
+
+
+async def upgrade_to_tls(
+    stream: "FastStream",
+    *,
+    ssl_context: ssl.SSLContext,
+    server_hostname: str,
+    timeout: Optional[float],
+) -> "FastStream":
+    """Upgrade an already-connected plaintext ``FastStream`` to TLS in-place.
+
+    Used for ``CONNECT``-style HTTPS-through-proxy tunnelling: after we've
+    read the proxy's ``200`` response we hand the raw TCP transport to
+    ``loop.start_tls`` and swap in the new SSL transport.
+
+    The returned object is the same ``FastStream`` instance with its inner
+    transport replaced by the SSL one.
+    """
+    loop = asyncio.get_running_loop()
+    old_transport = stream._transport
+    if old_transport is None or stream._closed:
+        raise ConnectError("Cannot upgrade a closed stream to TLS")
+    if stream._queue:
+        # Any bytes already queued on the plaintext side would be lost by
+        # ``start_tls`` — the CONNECT response consumer must drain them first.
+        raise ConnectError(
+            "Unexpected bytes buffered before TLS upgrade; proxy may be misbehaving"
+        )
+
+    try:
+        coro = loop.start_tls(
+            old_transport,
+            stream,
+            ssl_context,
+            server_hostname=server_hostname,
+            ssl_handshake_timeout=timeout,
+        )
+        new_transport = await (
+            asyncio.wait_for(coro, timeout=timeout) if timeout is not None else coro
+        )
+    except asyncio.TimeoutError as exc:
+        raise ConnectTimeout(
+            f"TLS handshake with {server_hostname} timed out"
+        ) from exc
+    except ssl.SSLError as exc:
+        raise TLSError(
+            f"TLS handshake with {server_hostname} failed: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise ConnectError(
+            f"TLS handshake with {server_hostname} failed: {exc}"
+        ) from exc
+    if new_transport is None:
+        raise TLSError(f"TLS handshake with {server_hostname} returned no transport")
+    stream._transport = new_transport  # type: ignore[assignment]
     return stream

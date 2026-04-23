@@ -74,6 +74,137 @@ async with hyperhttp.Client() as client:
         await r.aread()
 ```
 
+### Testing without a server (`MockTransport`)
+
+```python
+from hyperhttp import Client, MockResponse, MockTransport
+
+def handler(request):
+    if request.url.path == "/users/1":
+        return MockResponse(200, json={"id": 1, "name": "Alice"})
+    return MockResponse(404)
+
+async with Client(transport=MockTransport(handler)) as client:
+    r = await client.get("https://api.example.com/users/1")
+    assert r.json()["name"] == "Alice"
+```
+
+Handlers can be sync or async. You can also pass a list of responses
+(replayed in order — great for retry tests), a single `MockResponse`, or
+a `{"GET /path": MockResponse(...)}` mapping. The full client stack runs
+— retries, auth, event hooks, cookies, redirects — the only thing
+replaced is the socket. Raise any `hyperhttp` exception from a handler
+to exercise error paths. See [Testing](https://hyperhttp.readthedocs.io/en/latest/testing/)
+for the full guide.
+
+### Event hooks (logging, tracing, request signing)
+
+```python
+async def log_request(request):
+    print(f">> {request.method} {request.url}")
+
+def inject_trace(request):
+    request.headers["X-Trace-Id"] = new_trace_id()
+
+async def log_response(response):
+    print(f"<< {response.status_code} {response.url}")
+
+async with hyperhttp.Client(
+    event_hooks={
+        "request":  [log_request, inject_trace],
+        "response": [log_response],
+    },
+) as client:
+    await client.get("https://api.example.com/things")
+```
+
+Hooks may be sync or async. `request` fires per network attempt (so retries
+and request signing work together) with the fully-prepared `Request`;
+mutations are live. `response` fires after the response headers arrive,
+before the body is streamed. Hook exceptions propagate — hooks are
+intentional, not best-effort.
+
+### Authentication
+
+```python
+import hyperhttp
+from hyperhttp import BasicAuth, BearerAuth, DigestAuth
+
+async with hyperhttp.Client(auth=("alice", "s3cret")) as client:
+    r = await client.get("https://api.example.com/me")
+
+# Or pick a scheme explicitly:
+async with hyperhttp.Client(auth=BearerAuth("tok-xyz")) as client:
+    ...
+
+# Per-request override; pass auth=None to disable the client default.
+await client.get("https://api.example.com/public", auth=None)
+await client.get("https://legacy.example.com/", auth=DigestAuth("user", "pw"))
+```
+
+`auth=("user", "pass")` is shorthand for `BasicAuth`. `DigestAuth` handles
+the 401 → challenge → retry round-trip automatically (RFC 7616; MD5 and
+SHA-256 including `-sess` variants, `qop=auth`).
+
+### Proxies
+
+```python
+# Single proxy for everything.
+async with hyperhttp.Client(proxies="http://proxy.corp:3128") as client:
+    await client.get("https://api.example.com/things")
+
+# Per-scheme, with basic auth.
+async with hyperhttp.Client(
+    proxies={
+        "http":  "http://user:pass@proxy.corp:3128",
+        "https": "http://user:pass@proxy.corp:3128",
+    },
+) as client:
+    ...
+```
+
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` are honoured
+automatically (`trust_env=True` by default). Set `trust_env=False` to ignore
+them. HTTPS requests are tunnelled through the proxy via `CONNECT`; SOCKS
+proxies are not supported.
+
+### File uploads (`multipart/form-data`)
+
+```python
+import pathlib, hyperhttp
+
+async with hyperhttp.Client() as client:
+    r = await client.post(
+        "https://api.example.com/upload",
+        data={"user": "alice", "role": "admin"},
+        files={
+            "avatar": ("me.png", b"\x89PNG...", "image/png"),
+            "report": pathlib.Path("./report.pdf"),
+        },
+    )
+```
+
+Files can be `bytes`, `str` paths, `pathlib.Path`, open binary file handles,
+`(filename, content[, content_type])` tuples, or a
+`hyperhttp.MultipartFile(...)` for full control. `data=` in the same call
+becomes the text fields of the same multipart body.
+
+The encoder streams file parts straight from disk in 1 MiB chunks and
+pre-computes `Content-Length` whenever every part's size is known, so the
+request goes out with `Content-Length` framing (no chunked encoding). A 1 GiB
+upload uses O(chunk) memory regardless of file size.
+
+Local benchmark, single connection, loopback to an `aiohttp` server, 100 MiB
+multipart body:
+
+| Client    | Throughput    | vs hyperhttp |
+| --------- | ------------- | ------------ |
+| hyperhttp | **3 780 MiB/s** | 1.0×         |
+| httpx     | 1 391 MiB/s   | 0.37×        |
+| aiohttp   |   856 MiB/s   | 0.23×        |
+
+Reproduce with `python examples/benchmark_multipart.py` on your machine.
+
 ### Retry and circuit breaker
 
 ```python

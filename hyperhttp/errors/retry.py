@@ -29,6 +29,28 @@ from hyperhttp.utils.backoff import BackoffStrategy, ExponentialBackoff
 
 logger = logging.getLogger("hyperhttp.errors.retry")
 
+
+def _safe_url_for_log(url: str) -> str:
+    """Strip query string and userinfo from ``url`` before logging.
+
+    Both commonly carry credentials (``?api_key=``, ``user:pass@``). We don't
+    want a retry log message to exfiltrate them into shared log aggregators.
+    Best-effort: on any parse failure, fall back to scheme://host to keep the
+    log useful without the risky bits.
+    """
+    try:
+        from hyperhttp._url import URL
+
+        return URL(url).sanitized()
+    except Exception:
+        try:
+            from urllib.parse import urlparse
+
+            p = urlparse(url)
+            return f"{p.scheme}://{p.hostname or ''}{p.path or ''}"
+        except Exception:
+            return "<url>"
+
 __all__ = [
     "RetryError",
     "RetryPolicy",
@@ -236,7 +258,7 @@ class RetryHandler:
                 logger.info(
                     "Retrying %s %s after %s, retry %d in %.2fs",
                     method,
-                    url,
+                    _safe_url_for_log(url),
                     category,
                     retry_count + 1,
                     backoff,

@@ -56,3 +56,6 @@ dmypy.json
 
 # pyenv
 .python-version
+
+# MkDocs build output
+site/

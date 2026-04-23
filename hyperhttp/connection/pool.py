@@ -25,6 +25,7 @@ import time
 from collections import deque
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
+from hyperhttp._proxy import ProxyConfig, ProxyURL
 from hyperhttp._url import URL
 from hyperhttp.connection.transport import Transport, connect_transport
 from hyperhttp.exceptions import PoolClosed, PoolTimeout
@@ -49,6 +50,7 @@ class PoolOptions:
         "ssl_context",
         "connect_timeout",
         "happy_eyeballs_delay",
+        "proxy_config",
     )
 
     def __init__(
@@ -63,6 +65,7 @@ class PoolOptions:
         ssl_context: Any = None,
         connect_timeout: Optional[float] = 10.0,
         happy_eyeballs_delay: float = 0.25,
+        proxy_config: Optional[ProxyConfig] = None,
     ) -> None:
         self.max_connections = max_connections
         self.max_connections_per_host = max_connections_per_host
@@ -73,6 +76,7 @@ class PoolOptions:
         self.ssl_context = ssl_context
         self.connect_timeout = connect_timeout
         self.happy_eyeballs_delay = happy_eyeballs_delay
+        self.proxy_config = proxy_config
 
 
 class ConnectionPool:
@@ -88,6 +92,7 @@ class ConnectionPool:
         dns: DNSResolver,
         buffer_pool: BufferPool,
         manager: "ConnectionPoolManager",
+        proxy: Optional[ProxyURL] = None,
     ) -> None:
         self._host = host
         self._port = port
@@ -96,6 +101,7 @@ class ConnectionPool:
         self._dns = dns
         self._buffer_pool = buffer_pool
         self._manager = manager
+        self._proxy = proxy
 
         self._idle: Deque[Transport] = deque()
         self._active: Dict[int, Transport] = {}
@@ -105,7 +111,13 @@ class ConnectionPool:
         # Serialize the *first* connect for HTTPS pools so concurrent waiters
         # can share the eventual H2 multiplex rather than racing into N
         # separate TLS handshakes only to discover ALPN picked H2.
-        self._probing_alpn = scheme == "https" and options.http2
+        # Proxies that force HTTP/1.1 (plain-http via proxy) opt out; HTTPS
+        # via CONNECT still does ALPN inside the tunnel.
+        self._probing_alpn = (
+            scheme == "https" and options.http2
+        )
+        if proxy is not None and scheme == "http":
+            self._probing_alpn = False
         self._probe_done: Optional["asyncio.Event"] = None
 
     # -- public ------------------------------------------------------------
@@ -191,14 +203,12 @@ class ConnectionPool:
                 return await asyncio.wait_for(asyncio.shield(waiter), timeout)
             return await waiter
         except asyncio.TimeoutError as exc:
-            waiter.cancel()
-            self._prune_cancelled_waiters()
+            self._reclaim_waiter_or_cancel(waiter)
             raise PoolTimeout(
                 f"Timed out waiting for a connection to {self.host_port}"
             ) from exc
         except BaseException:
-            waiter.cancel()
-            self._prune_cancelled_waiters()
+            self._reclaim_waiter_or_cancel(waiter)
             raise
 
     def release(self, transport: Transport, *, discard: bool = False) -> None:
@@ -283,6 +293,7 @@ class ConnectionPool:
             happy_eyeballs_delay=self._options.happy_eyeballs_delay,
             buffer_pool=self._buffer_pool,
             enable_http2=self._options.http2,
+            proxy=self._proxy,
         )
 
     def _hand_off_to_waiter(self, transport: Transport) -> bool:
@@ -312,6 +323,39 @@ class ConnectionPool:
 
     def _prune_cancelled_waiters(self) -> None:
         self._waiters = deque(w for w in self._waiters if not (w.cancelled() or w.done()))
+
+    def _reclaim_waiter_or_cancel(
+        self, waiter: "asyncio.Future[Transport]"
+    ) -> None:
+        """Safely wind down a waiter on timeout / cancellation.
+
+        There is a narrow race between ``asyncio.wait_for`` raising
+        ``TimeoutError`` and ``release()`` running ``_hand_off_to_waiter``
+        against that same waiter. If the hand-off wins the race, the
+        transport was placed in ``_active`` and ``set_result`` was called —
+        but from the *caller's* perspective the acquire has timed out, so
+        the transport would leak forever. Here we check whether a handoff
+        happened and, if so, release the transport back to the pool so the
+        next waiter can use it.
+        """
+        if waiter.done() and not waiter.cancelled():
+            try:
+                transport = waiter.result()
+            except BaseException:
+                transport = None  # type: ignore[assignment]
+            if transport is not None:
+                # ``release`` handles H1 vs H2 semantics correctly; the
+                # transport was just placed into ``_active`` by the handoff.
+                try:
+                    self.release(transport)
+                except Exception:
+                    # Last-ditch: make sure the global semaphore doesn't leak.
+                    self._active.pop(id(transport), None)
+                    asyncio.create_task(self._close_transport(transport))
+                    self._manager._release_global()
+        else:
+            waiter.cancel()
+        self._prune_cancelled_waiters()
 
     async def _close_transport(self, transport: Transport) -> None:
         try:
@@ -372,7 +416,14 @@ class ConnectionPoolManager:
     async def acquire(self, url: URL, *, timeout: Optional[float] = None) -> Transport:
         if self._closed:
             raise PoolClosed("Pool manager is closed")
-        key = f"{url.scheme}://{url.host_port}"
+        proxy: Optional[ProxyURL] = None
+        proxy_config = self._options.proxy_config
+        if proxy_config is not None and proxy_config.has_any():
+            proxy = proxy_config.for_url(url)
+        # Pool partition: same origin via different proxies (or direct vs
+        # proxied) cannot share connections.
+        proxy_key = proxy.pool_key() if proxy is not None else ""
+        key = f"{url.scheme}://{url.host_port}|{proxy_key}"
         pool = self._pools.get(key)
         if pool is None:
             pool = ConnectionPool(
@@ -383,6 +434,7 @@ class ConnectionPoolManager:
                 dns=self._dns,
                 buffer_pool=self._buffer_pool,
                 manager=self,
+                proxy=proxy,
             )
             self._pools[key] = pool
         return await pool.acquire(url, timeout=timeout)

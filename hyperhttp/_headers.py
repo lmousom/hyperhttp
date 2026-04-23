@@ -22,6 +22,8 @@ from typing import (
     Union,
 )
 
+from hyperhttp._validate import validate_header_name, validate_header_value
+
 HeadersInput = Union[
     None,
     "Headers",
@@ -54,6 +56,10 @@ class Headers:
     # -- mutation -----------------------------------------------------------
 
     def _append(self, name: str, value: str) -> None:
+        # Validate every insertion — cheap, and the only place every code path
+        # (``add``, ``set``, ``update``, ``__init__``) funnels through.
+        validate_header_name(name)
+        validate_header_value(value)
         key = name.lower()
         self._index.setdefault(key, []).append(len(self._list))
         self._list.append((name, value))

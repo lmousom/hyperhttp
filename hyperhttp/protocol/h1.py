@@ -23,6 +23,12 @@ import os
 
 from hyperhttp._compat import HAS_H11, h11
 from hyperhttp._headers import Headers
+from hyperhttp._validate import (
+    validate_header_name,
+    validate_header_value,
+    validate_method,
+    validate_target,
+)
 from hyperhttp.exceptions import LocalProtocolError, RemoteProtocolError
 
 # The pure-Python parser is ~2x faster than h11 on the client hot path and
@@ -61,13 +67,29 @@ def build_request_head(
     content_length: Optional[int] = None,
     chunked: bool = False,
 ) -> bytes:
-    """Build the HTTP/1.1 request head (request line + headers + CRLF)."""
+    """Build the HTTP/1.1 request head (request line + headers + CRLF).
+
+    Every field written to the wire is validated here as a defence-in-depth
+    check: ``Headers`` already validates at insertion, but the method, target,
+    and Host value flow in from the URL/caller directly. Rejecting CR/LF/NUL
+    makes HTTP request smuggling / header injection impossible regardless of
+    what the caller does with user-supplied strings.
+    """
+    validate_method(method)
+    validate_target(target)
+    validate_header_value(host)
+
     parts: List[str] = [f"{method} {target} HTTP/1.1\r\n"]
 
     have_host = False
     have_cl = False
     have_te = False
     for name, value in headers.items():
+        # Header names/values were validated at insertion (see Headers._append),
+        # but revalidate on the way out so a ``copy()`` that bypassed _append
+        # cannot smuggle CRLF back in.
+        validate_header_name(name)
+        validate_header_value(value)
         lname = name.lower()
         if lname == "host":
             have_host = True

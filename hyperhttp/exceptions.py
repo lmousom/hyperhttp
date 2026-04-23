@@ -57,6 +57,10 @@ class DNSError(TransportError):
     """DNS resolution failed."""
 
 
+class ProxyError(TransportError):
+    """Failed to establish or use an HTTP proxy tunnel."""
+
+
 # --- Timeouts --------------------------------------------------------------
 
 
@@ -134,6 +138,27 @@ class ResponseClosed(StreamError):
     """Operation attempted on a closed response."""
 
 
+# --- Resource limits ------------------------------------------------------
+
+
+class ResponseTooLarge(HyperHTTPError):
+    """Response body (decoded or raw) exceeded the configured size limit.
+
+    Raised by the response stream when either the raw body or the decoded
+    body crosses ``max_response_size`` / ``max_decompressed_size``. Treated
+    as a protocol-layer error to short-circuit further reads; the caller
+    can catch it to abort cleanly without OOMing.
+    """
+
+
+class DecompressionError(HyperHTTPError):
+    """A decoder failed or was fed data that exceeded its configured cap.
+
+    Sub-case of decompression-bomb protection: ``max_decompressed_size``
+    was exceeded before the decoder finished producing output.
+    """
+
+
 __all__ = [
     "HyperHTTPError",
     "TransportError",
@@ -145,6 +170,7 @@ __all__ = [
     "ReadError",
     "WriteError",
     "DNSError",
+    "ProxyError",
     "TimeoutException",
     "ConnectTimeout",
     "ReadTimeout",
@@ -158,4 +184,6 @@ __all__ = [
     "StreamError",
     "StreamConsumed",
     "ResponseClosed",
+    "ResponseTooLarge",
+    "DecompressionError",
 ]
